@@ -1,0 +1,148 @@
+networks:
+  leadagent-net:
+    driver: bridge
+
+services:
+
+  # ── Agent containers ─────────────────────────────────────────────────────────
+  # Each CLI runs in isolation. Auth dirs mounted from host — no re-auth needed.
+  # Backend reaches them via: docker exec -i leadagent-claude claude -p "..."
+
+  claude-agent:
+    build:
+      context: .
+      dockerfile: agents/claude/Dockerfile
+    container_name: leadagent-claude
+    labels:
+      - "com.leadagent.tag=true"
+    environment:
+      - LEADAGENT_TAG=true
+    networks:
+      - leadagent-net
+    volumes:
+      - .:/app/leadagent-data
+      - ${HOME}/.claude:/root/.claude
+      # Mirror host projects path
+      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  gemini-agent:
+    build:
+      context: .
+      dockerfile: agents/gemini/Dockerfile
+    container_name: leadagent-gemini
+    labels:
+      - "com.leadagent.tag=true"
+    environment:
+      - LEADAGENT_TAG=true
+    networks:
+      - leadagent-net
+    volumes:
+      - .:/app/leadagent-data
+      - ${HOME}/.gemini:/root/.gemini
+      - ${HOME}/.config/google-chrome:/root/.config/google-chrome:ro
+      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+      # Mirror host projects path
+      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  codex-agent:
+    build:
+      context: .
+      dockerfile: agents/codex/Dockerfile
+    container_name: leadagent-codex
+    labels:
+      - "com.leadagent.tag=true"
+    environment:
+      - LEADAGENT_TAG=true
+    networks:
+      - leadagent-net
+    volumes:
+      - .:/app/leadagent-data
+      # Mirror host projects path
+      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  grok-agent:
+    build:
+      context: .
+      dockerfile: agents/grok/Dockerfile
+    container_name: leadagent-grok
+    labels:
+      - "com.leadagent.tag=true"
+    environment:
+      - LEADAGENT_TAG=true
+    networks:
+      - leadagent-net
+    volumes:
+      - .:/app/leadagent-data
+      # Mirror host projects path
+      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  # ── Main backend daemon ──────────────────────────────────────────────────────
+  backend:
+    build: .
+    container_name: leadagent-backend
+    labels:
+      - "com.leadagent.tag=true"
+    networks:
+      - leadagent-net
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app/leadagent-data
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mirror host projects path
+      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+    environment:
+      - PYTHONPATH=/app/leadagent-data
+      - TERM=xterm-256color
+      - COLORTERM=truecolor
+      - LEADAGENT_DOCKER_MODE=1
+      - LEADAGENT_TAG=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    depends_on:
+      - claude-agent
+      - gemini-agent
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Watchdog ─────────────────────────────────────────────────────────────────
+  watchdog:
+    build: .
+    container_name: leadagent-watchdog
+    labels:
+      - "com.leadagent.tag=true"
+    networks:
+      - leadagent-net
+    command: >
+      sh -c "while true; do python backend/watchdog.py; sleep 30; done"
+    volumes:
+      - .:/app/leadagent-data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - PYTHONPATH=/app/leadagent-data
+      - LEADAGENT_TAG=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+# NOTE — agentmemory is NOT included here.
+# Start it natively before docker compose up:  agentmemory serve --port 3111

@@ -1,0 +1,244 @@
+"""Tests for backend/agents.py — CLIAgent, AgentFactory, _execute_claude_stream."""
+
+import json
+import os
+from unittest.mock import patch, MagicMock
+
+import pytest
+
+from backend.agents import CLIAgent, AgentFactory, agent_factory, _PROJECT_ROOT
+
+
+# ── _PROJECT_ROOT ─────────────────────────────────────────────────────────────
+
+class TestProjectRoot:
+    def test_is_a_directory(self):
+        assert os.path.isdir(_PROJECT_ROOT)
+
+    def test_contains_backend(self):
+        assert os.path.isdir(os.path.join(_PROJECT_ROOT, "backend"))
+
+
+# ── AgentFactory ──────────────────────────────────────────────────────────────
+
+class TestAgentFactory:
+    def test_returns_cli_agent_for_claude(self):
+        agent = agent_factory.get_agent("claude")
+        assert isinstance(agent, CLIAgent)
+        assert agent.command == "claude"
+
+    def test_returns_cli_agent_for_gemini(self):
+        agent = agent_factory.get_agent("gemini")
+        assert agent.command == "gemini"
+
+    def test_returns_cli_agent_for_codex(self):
+        agent = agent_factory.get_agent("codex")
+        assert agent.command == "codex"
+
+    def test_raises_for_unknown_agent(self):
+        with pytest.raises(ValueError, match="Unknown agent"):
+            agent_factory.get_agent("skynet")
+
+
+# ── execute_stream — non-claude agents ───────────────────────────────────────
+
+class TestExecuteStreamNonClaude:
+    def _fake_process(self, lines, returncode=0):
+        proc = MagicMock()
+        proc.stdout = iter(lines)
+        proc.returncode = returncode
+        proc.stdin = MagicMock()
+        proc.wait = MagicMock()
+        return proc
+
+    def test_gemini_yields_text_lines(self):
+        agent = CLIAgent("gemini")
+        proc = self._fake_process(["Hello\n", "World\n"])
+        with patch("subprocess.Popen", return_value=proc):
+            chunks = list(agent.execute_stream("say hello", session_id="s1"))
+        assert any("Hello" in c for c in chunks)
+        assert any("World" in c for c in chunks)
+
+    def test_suppressed_prefixes_filtered(self):
+        agent = CLIAgent("gemini")
+        proc = self._fake_process([
+            "Warning: 256-color support not detected\n",
+            "Actual response\n",
+        ])
+        with patch("subprocess.Popen", return_value=proc):
+            chunks = list(agent.execute_stream("hi", session_id="s1"))
+        assert not any("256-color" in c for c in chunks)
+        assert any("Actual response" in c for c in chunks)
+
+    def test_ansi_codes_stripped(self):
+        agent = CLIAgent("gemini")
+        proc = self._fake_process(["\x1b[32mGreen text\x1b[0m\n"])
+        with patch("subprocess.Popen", return_value=proc):
+            chunks = list(agent.execute_stream("hi", session_id="s1"))
+        assert any("Green text" in c for c in chunks)
+        assert not any("\x1b" in c for c in chunks)
+
+    def test_nonzero_returncode_raises_quota_exhausted(self):
+        agent = CLIAgent("gemini")
+        proc = self._fake_process([], returncode=1)
+        with patch("subprocess.Popen", return_value=proc):
+            with pytest.raises(Exception, match="AGENT_QUOTA_EXHAUSTED"):
+                list(agent.execute_stream("hi", session_id="s1"))
+
+    def test_zero_returncode_no_exception(self):
+        agent = CLIAgent("gemini")
+        proc = self._fake_process(["ok\n"], returncode=0)
+        with patch("subprocess.Popen", return_value=proc):
+            list(agent.execute_stream("hi", session_id="s1"))  # no exception
+
+    def test_large_prompt_uses_stdin(self):
+        agent = CLIAgent("codex")
+        big_prompt = "x" * 200_000
+        proc = self._fake_process(["response\n"])
+        with patch("subprocess.Popen", return_value=proc) as mock_popen:
+            list(agent.execute_stream(big_prompt, session_id="s1"))
+        call_args = mock_popen.call_args
+        # stdin=PIPE when prompt exceeds ARG_MAX
+        assert call_args.kwargs.get("stdin") is not None or \
+               call_args[1].get("stdin") is not None
+
+
+# ── _execute_claude_stream ────────────────────────────────────────────────────
+
+class TestExecuteClaudeStream:
+    def _fake_claude_process(self, events, returncode=0):
+        lines = [json.dumps(e) + "\n" for e in events]
+        proc = MagicMock()
+        proc.stdout = iter(lines)
+        proc.returncode = returncode
+        proc.stdin = MagicMock()
+        proc.wait = MagicMock()
+        return proc
+
+    def test_extracts_text_from_assistant_event(self):
+        agent = CLIAgent("claude")
+        events = [
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello world"}]}},
+            {"type": "result", "subtype": "success"},
+        ]
+        proc = self._fake_claude_process(events)
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch("tempfile.NamedTemporaryFile") as mock_tmp,
+            patch("os.unlink"),
+        ):
+            mock_tmp.return_value.__enter__.return_value.name = "/tmp/fake.json"
+            mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
+            chunks = list(agent.execute_stream("hello", session_id="s1"))
+        assert any("Hello world" in c for c in chunks)
+
+    def test_extracts_streaming_text_delta(self):
+        agent = CLIAgent("claude")
+        events = [
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello "}},
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "world"}},
+        ]
+        proc = self._fake_claude_process(events)
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch("tempfile.NamedTemporaryFile") as mock_tmp,
+            patch("os.unlink"),
+        ):
+            mock_tmp.return_value.__enter__.return_value.name = "/tmp/fake.json"
+            mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
+            chunks = list(agent.execute_stream("hello", session_id="s1"))
+        assert "".join(chunks) == "Hello world"
+
+    def test_skips_non_json_lines(self):
+        agent = CLIAgent("claude")
+        proc = MagicMock()
+        proc.stdout = iter(["not json\n", '{"type":"result","subtype":"success"}\n'])
+        proc.returncode = 0
+        proc.stdin = MagicMock()
+        proc.wait = MagicMock()
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch("tempfile.NamedTemporaryFile") as mock_tmp,
+            patch("os.unlink"),
+        ):
+            mock_tmp.return_value.__enter__.return_value.name = "/tmp/fake.json"
+            mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
+            chunks = list(agent.execute_stream("hello", session_id="s1"))
+        assert chunks == []  # no text content emitted
+
+    def test_result_error_with_quota_signal_raises(self):
+        agent = CLIAgent("claude")
+        events = [
+            {"type": "result", "subtype": "error", "result": "You've hit your usage limit."},
+        ]
+        proc = self._fake_claude_process(events)
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch("tempfile.NamedTemporaryFile") as mock_tmp,
+            patch("os.unlink"),
+        ):
+            mock_tmp.return_value.__enter__.return_value.name = "/tmp/fake.json"
+            mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
+            with pytest.raises(Exception, match="AGENT_QUOTA_EXHAUSTED"):
+                list(agent.execute_stream("hello", session_id="s1"))
+
+    def test_mcp_config_written_with_session_id(self):
+        agent = CLIAgent("claude")
+        proc = self._fake_claude_process([])
+        written_content = {}
+
+        class FakeTmp:
+            name = "/tmp/fake_mcp.json"
+            def write(self, s):
+                written_content["data"] = s
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch("tempfile.NamedTemporaryFile", return_value=FakeTmp()),
+            patch("json.dump", side_effect=lambda obj, fh: written_content.update(obj)),
+            patch("os.unlink"),
+        ):
+            list(agent.execute_stream("hello", session_id="my-session"))
+
+        server_cfg = written_content.get("mcpServers", {}).get("leadagent_perm", {})
+        assert server_cfg.get("env", {}).get("LEADAGENT_SESSION_ID") == "my-session"
+
+    def test_temp_file_cleaned_up_on_success(self):
+        agent = CLIAgent("claude")
+        proc = self._fake_claude_process([])
+        deleted = []
+
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch("tempfile.NamedTemporaryFile") as mock_tmp,
+            patch("os.unlink", side_effect=lambda p: deleted.append(p)),
+        ):
+            mock_tmp.return_value.__enter__.return_value.name = "/tmp/cleanup_test.json"
+            mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
+            list(agent.execute_stream("hello", session_id="s1"))
+
+        assert "/tmp/cleanup_test.json" in deleted
+
+    def test_temp_file_cleaned_up_on_exception(self):
+        agent = CLIAgent("claude")
+        proc = MagicMock()
+        proc.stdout = iter(['{"type":"result","subtype":"error","result":"quota exhausted"}\n'])
+        proc.returncode = 0
+        proc.stdin = MagicMock()
+        proc.wait = MagicMock()
+        deleted = []
+
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch("tempfile.NamedTemporaryFile") as mock_tmp,
+            patch("os.unlink", side_effect=lambda p: deleted.append(p)),
+        ):
+            mock_tmp.return_value.__enter__.return_value.name = "/tmp/cleanup_exc.json"
+            mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
+            with pytest.raises(Exception):
+                list(agent.execute_stream("hello", session_id="s1"))
+
+        assert "/tmp/cleanup_exc.json" in deleted

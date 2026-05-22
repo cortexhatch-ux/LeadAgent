@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.leadagent.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/deebee/IdeaProjects/LeadAgent/start_backend.sh</string>
+    </array>
+    <key>WorkingDirectory</key><string>/Users/deebee/IdeaProjects/LeadAgent</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key><string>/Users/deebee/IdeaProjects/LeadAgent</string>
+        <key>PATH</key><string>/Users/deebee/.leadagent/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>/Users/deebee/IdeaProjects/LeadAgent/data/daemon.log</string>
+    <key>StandardErrorPath</key><string>/Users/deebee/IdeaProjects/LeadAgent/data/daemon.log</string>
+</dict>
+</plist>

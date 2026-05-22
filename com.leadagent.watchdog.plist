@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.leadagent.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/deebee/IdeaProjects/LeadAgent/leadagent/bin/python3</string>
+        <string>/Users/deebee/IdeaProjects/LeadAgent/backend/watchdog.py</string>
+    </array>
+    <key>WorkingDirectory</key><string>/Users/deebee/IdeaProjects/LeadAgent</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key><string>/Users/deebee/IdeaProjects/LeadAgent</string>
+        <key>PATH</key><string>/Users/deebee/.leadagent/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StartInterval</key><integer>30</integer>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>/Users/deebee/IdeaProjects/LeadAgent/data/watchdog.log</string>
+    <key>StandardErrorPath</key><string>/Users/deebee/IdeaProjects/LeadAgent/data/watchdog.log</string>
+</dict>
+</plist>

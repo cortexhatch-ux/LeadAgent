@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+kuzu
+pydantic
+python-dotenv
+requests
+pexpect

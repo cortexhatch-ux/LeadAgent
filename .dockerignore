@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+data/
+.idea/
+cli/
+*.md
+*.iml
+*.plist
+*.sh
+.env
