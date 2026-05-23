@@ -109,6 +109,7 @@ services:
       - COLORTERM=truecolor
       - LEADAGENT_DOCKER_MODE=1
       - LEADAGENT_TAG=true
+      - LEADAGENT_WORKSPACE=${LEADAGENT_WORKSPACE}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

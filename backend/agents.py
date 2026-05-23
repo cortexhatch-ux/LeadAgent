@@ -82,7 +82,14 @@ def _build_argv(cli: str, args: list[str], cwd: str = ".", tty: bool = False) ->
             if not os.path.isabs(cwd):
                 abs_cwd = os.path.join("/app/leadagent-data", cwd)
             # Host temp paths (macOS /var/folders) aren't mounted in containers.
-            _MOUNTED_PREFIXES = ("/app/leadagent-data", os.path.expanduser("~"))
+            _MOUNTED_PREFIXES = [
+                "/app/leadagent-data",
+                os.path.expanduser("~")
+            ]
+            workspace = os.environ.get("LEADAGENT_WORKSPACE")
+            if workspace:
+                _MOUNTED_PREFIXES.append(workspace)
+
             if not any(abs_cwd.startswith(p) for p in _MOUNTED_PREFIXES):
                 abs_cwd = "/tmp"
             flags = ["-it"] if tty else ["-i"]
