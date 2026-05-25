@@ -12,6 +12,7 @@ import time
 
 try:
     import pexpect
+
     _PEXPECT_AVAILABLE = True
 except ImportError:
     _PEXPECT_AVAILABLE = False
@@ -23,7 +24,6 @@ from backend.agents import is_installed_anywhere, _build_argv
 
 
 class ClaudeScraper(BaseScraper):
-
     @property
     def name(self) -> str:
         return "claude"
@@ -34,7 +34,7 @@ class ClaudeScraper(BaseScraper):
         if data.get("model_tier"):
             return data["model_tier"]
         if data.get("model"):
-            m = re.search(r'(opus|sonnet|haiku)', data["model"], re.IGNORECASE)
+            m = re.search(r"(opus|sonnet|haiku)", data["model"], re.IGNORECASE)
             if m:
                 return m.group(1).lower()
 
@@ -44,8 +44,11 @@ class ClaudeScraper(BaseScraper):
         try:
             argv = _build_argv("claude", ["--bare", "--print", "hi"], tty=True)
             child = pexpect.spawn(
-                argv[0], args=argv[1:],
-                timeout=8, encoding="utf-8", echo=False,
+                argv[0],
+                args=argv[1:],
+                timeout=8,
+                encoding="utf-8",
+                echo=False,
                 dimensions=(10, 160),
             )
             try:
@@ -80,8 +83,11 @@ class ClaudeScraper(BaseScraper):
         try:
             argv = _build_argv("claude", [], tty=True)
             child = pexpect.spawn(
-                argv[0], args=argv[1:],
-                timeout=30, encoding="utf-8", echo=False,
+                argv[0],
+                args=argv[1:],
+                timeout=30,
+                encoding="utf-8",
+                echo=False,
                 dimensions=(80, 200),
             )
             time.sleep(3)

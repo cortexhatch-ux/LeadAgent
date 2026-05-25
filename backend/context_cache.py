@@ -10,19 +10,18 @@ repeated context noise.
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 
-_SESSION_TTL = 2 * 3600   # expire idle sessions after 2 hours
+_SESSION_TTL = 2 * 3600  # expire idle sessions after 2 hours
 
 
 @dataclass
 class _SessionState:
-    injected_entities:    dict[str, str]  = field(default_factory=dict)   # name -> tag
-    injected_relations:   dict[str, str]  = field(default_factory=dict)   # "A->B" -> tag
-    injected_qa_keys:     dict[int, str]  = field(default_factory=dict)   # hash -> tag
-    injected_memory_keys: dict[int, str]  = field(default_factory=dict)   # hash -> tag
-    last_active:          float = field(default_factory=time.time)
+    injected_entities: dict[str, str] = field(default_factory=dict)  # name -> tag
+    injected_relations: dict[str, str] = field(default_factory=dict)  # "A->B" -> tag
+    injected_qa_keys: dict[int, str] = field(default_factory=dict)  # hash -> tag
+    injected_memory_keys: dict[int, str] = field(default_factory=dict)  # hash -> tag
+    last_active: float = field(default_factory=time.time)
 
     def touch(self):
         self.last_active = time.time()
@@ -43,7 +42,7 @@ class ContextCache:
     """
 
     def __init__(self):
-        self._lock    = threading.Lock()
+        self._lock = threading.Lock()
         self._sessions: dict[str, _SessionState] = {}
 
     def _get(self, session_id: str) -> _SessionState:
@@ -55,8 +54,11 @@ class ContextCache:
 
     def _expire(self):
         now = time.time()
-        expired = [sid for sid, s in self._sessions.items()
-                   if now - s.last_active > _SESSION_TTL]
+        expired = [
+            sid
+            for sid, s in self._sessions.items()
+            if now - s.last_active > _SESSION_TTL
+        ]
         for sid in expired:
             del self._sessions[sid]
 
@@ -90,12 +92,12 @@ class ContextCache:
 
     def commit(
         self,
-        session_id:   str,
-        entities:     list = (),
-        relations:    list = (),
-        qa_rows:      list = (),
+        session_id: str,
+        entities: list = (),
+        relations: list = (),
+        qa_rows: list = (),
         memory_snippets: list = (),
-        tag:          str = "default"
+        tag: str = "default",
     ):
         """Mark these items as injected so they're skipped next time."""
         with self._lock:
@@ -116,10 +118,18 @@ class ContextCache:
             if session_id not in self._sessions:
                 return
             s = self._sessions[session_id]
-            s.injected_entities = {k: v for k, v in s.injected_entities.items() if v != tag}
-            s.injected_relations = {k: v for k, v in s.injected_relations.items() if v != tag}
-            s.injected_qa_keys = {k: v for k, v in s.injected_qa_keys.items() if v != tag}
-            s.injected_memory_keys = {k: v for k, v in s.injected_memory_keys.items() if v != tag}
+            s.injected_entities = {
+                k: v for k, v in s.injected_entities.items() if v != tag
+            }
+            s.injected_relations = {
+                k: v for k, v in s.injected_relations.items() if v != tag
+            }
+            s.injected_qa_keys = {
+                k: v for k, v in s.injected_qa_keys.items() if v != tag
+            }
+            s.injected_memory_keys = {
+                k: v for k, v in s.injected_memory_keys.items() if v != tag
+            }
 
     def invalidate(self, session_id: str):
         """Force a full re-injection on next message (e.g. after /clear)."""
@@ -132,12 +142,12 @@ class ContextCache:
                 return {"active": False}
             s = self._sessions[session_id]
             return {
-                "active":           True,
+                "active": True,
                 "injected_entities": len(s.injected_entities),
                 "injected_relations": len(s.injected_relations),
-                "injected_qa":       len(s.injected_qa_keys),
-                "injected_memory":   len(s.injected_memory_keys),
-                "idle_seconds":      int(time.time() - s.last_active),
+                "injected_qa": len(s.injected_qa_keys),
+                "injected_memory": len(s.injected_memory_keys),
+                "idle_seconds": int(time.time() - s.last_active),
             }
 
 

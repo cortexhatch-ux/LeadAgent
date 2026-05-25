@@ -3,6 +3,7 @@
 Both the GUI setup wizard and the CLI onboarding flow read from here so we
 don't drift definitions across files.
 """
+
 from __future__ import annotations
 
 import json
@@ -41,13 +42,14 @@ _AUTH_OK_TOKENS = (
     "sonnet",
     "opus",
     "haiku",
-    "0.", "1.", "2.", # Recognize version numbers (for non-interactive probes)
+    "0.",
+    "1.",
+    "2.",  # Recognize version numbers (for non-interactive probes)
 )
 # "Logged in" alone isn't enough to prove a paid tier exists, but it's the
 # stronger signal CLIs other than claude expose. We surface "signed in" in the
 # UI; the user remains responsible for declaring which subscriptions they pay
 # for via the wizard (stored in leadagent-data/config.json).
-
 
 
 AGENTS: dict[str, AgentSpec] = {
@@ -120,8 +122,8 @@ def _container_running(agent_key: str) -> bool:
     container_map = {
         "claude": "leadagent-claude",
         "gemini": "leadagent-gemini",
-        "codex":  "leadagent-codex",
-        "grok":   "leadagent-grok",
+        "codex": "leadagent-codex",
+        "grok": "leadagent-grok",
     }
     container = container_map.get(agent_key)
     if not container or not shutil.which("docker"):
@@ -129,7 +131,9 @@ def _container_running(agent_key: str) -> bool:
     try:
         result = subprocess.run(
             ["docker", "inspect", "-f", "{{.State.Running}}", container],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True,
+            text=True,
+            timeout=2,
         )
         return result.stdout.strip() == "true"
     except Exception:
@@ -164,14 +168,14 @@ def is_authenticated(agent_key: str) -> Optional[bool]:
         return None
     if not is_installed(agent_key):
         return False
-    
+
     # Build command: use docker exec if in Docker mode and container is up
     if os.environ.get("LEADAGENT_DOCKER_MODE") and _container_running(agent_key):
         container_map = {
             "claude": "leadagent-claude",
             "gemini": "leadagent-gemini",
-            "codex":  "leadagent-codex",
-            "grok":   "leadagent-grok",
+            "codex": "leadagent-codex",
+            "grok": "leadagent-grok",
         }
         cmd = ["docker", "exec", "-i", container_map[agent_key]] + spec.auth_check
     else:

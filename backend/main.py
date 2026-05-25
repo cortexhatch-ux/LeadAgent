@@ -1,4 +1,3 @@
-import os
 import queue as _queue
 import shutil
 import socket
@@ -14,11 +13,13 @@ import uvicorn
 import json
 import asyncio
 
-from backend.models import Entity, Relationship
+from backend.models import Entity, Relationship, ErrorType
 from backend.db import db
 from backend.memory_client import memory_client
+from backend.context_cache import context_cache
 from backend.router import agent_router
-from backend.agents import agent_factory, CLIAgent, is_installed_anywhere
+from backend.agents import agent_factory, is_installed_anywhere
+
 from backend.roles import ROLE_DESCRIPTIONS
 from backend.scraper import scraper
 from backend.permissions import broker
@@ -57,9 +58,10 @@ class ProjectInitRequest(BaseModel):
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+
 def _fmt_ms(ms: float) -> str:
     if ms >= 1000:
-        return f"{ms/1000:.2f}s"
+        return f"{ms / 1000:.2f}s"
     return f"{ms:.0f}ms"
 
 
@@ -73,6 +75,7 @@ def _port_open(host: str, port: int, timeout: float = 1.0) -> bool:
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
 
+
 @app.get("/")
 async def root():
     return {"status": "LeadAgent Daemon is running"}
@@ -83,17 +86,26 @@ async def health():
     uptime = round(_time.time() - _START_TIME, 1)
 
     db_status = "ok"
+    db_error = None
     entity_count = 0
     try:
         rows = db.query_all("MATCH (e:Entity) RETURN count(e)")
         entity_count = int(rows[0][0]) if rows else 0
-    except Exception:
+    except Exception as e:
         db_status = "error"
+        db_error = str(e)
 
-    mem_host = "host.docker.internal" if os.environ.get("LEADAGENT_DOCKER_MODE") else "localhost"
-    mem_status = "ok" if _port_open(mem_host, 3111) else "unavailable"
+    # Try both common hosts for the memory service
+    mem_status = "unavailable"
+    mem_detail = "Checked localhost and host.docker.internal on port 3111"
+    for host in ("localhost", "host.docker.internal", "127.0.0.1"):
+        if _port_open(host, 3111):
+            mem_status = "ok"
+            mem_detail = f"Connected to {host}:3111"
+            break
 
     from backend.agents_catalog import enabled_agents, is_authenticated, AGENTS
+
     enabled = enabled_agents()
     agents = {}
     for name in AGENTS:
@@ -103,7 +115,7 @@ async def health():
         usable = installed and is_enabled and signed_in is not False
         agents[name] = {
             "installed": installed,
-            "enabled":   is_enabled,
+            "enabled": is_enabled,
             "signed_in": signed_in,
             "available": usable,
         }
@@ -111,15 +123,21 @@ async def health():
     overall = "ok"
     if db_status == "error":
         overall = "error"
-    elif mem_status == "unavailable" or not any(a["available"] for a in agents.values()):
+    elif mem_status == "unavailable" or not any(
+        a["available"] for a in agents.values()
+    ):
         overall = "degraded"
 
     return {
         "status": overall,
         "uptime_seconds": uptime,
         "components": {
-            "database":       {"status": db_status, "entity_count": entity_count},
-            "memory_service": {"status": mem_status},
+            "database": {
+                "status": db_status,
+                "entity_count": entity_count,
+                "error": db_error,
+            },
+            "memory_service": {"status": mem_status, "detail": mem_detail},
             "agents": agents,
         },
     }
@@ -135,6 +153,7 @@ async def init_project(request: ProjectInitRequest):
 async def onboard():
     """Non-interactive environment check — never prompts (would deadlock here)."""
     from backend.onboarding import onboarding
+
     asyncio.create_task(
         asyncio.to_thread(onboarding.check_and_fix_environment, interactive=False)
     )
@@ -146,38 +165,40 @@ async def audit_session(session_id: str):
     """Reconstruct the causal narrative for a session (Consensus Round 4)."""
     # 1. Get recent Q&A for this session from episodic memory
     history = memory_client.search(f"session:{session_id}", limit=10)
-    
+
     narrative = []
     for item in history:
         agent = item["metadata"].get("agent")
         prompt = item["content"].split("\nAssistant:")[0].replace("User: ", "")
         task_type, complexity = agent_router._classify_task(prompt)
-        
+
         # 2. Query DB for the rationale used at the time
         affinity_rows = db.query_all(
             "MATCH (t:TaskType {name: $t})-[r:AFFINITY]->(a:AgentNode {name: $a}) RETURN r.score",
-            {"t": task_type, "a": agent}
+            {"t": task_type, "a": agent},
         )
         score = affinity_rows[0][0] if affinity_rows else 0.5
-        
+
         # 3. Check for failures
         failure_rows = db.query_all(
             "MATCH (a:AgentNode {name: $a})-[r:FAILED_BECAUSE]->(e:ErrorType) RETURN e.name, r.count",
-            {"a": agent}
+            {"a": agent},
         )
         failures = {r[0]: r[1] for r in failure_rows}
-        
-        narrative.append({
-            "prompt_preview": prompt[:100] + "...",
-            "agent": agent,
-            "rationale": {
-                "task_type": task_type,
-                "complexity": complexity,
-                "historical_affinity": score,
-                "known_failure_risks": failures
+
+        narrative.append(
+            {
+                "prompt_preview": prompt[:100] + "...",
+                "agent": agent,
+                "rationale": {
+                    "task_type": task_type,
+                    "complexity": complexity,
+                    "historical_affinity": score,
+                    "known_failure_risks": failures,
+                },
             }
-        })
-    
+        )
+
     return narrative
 
 
@@ -186,28 +207,32 @@ async def get_roi_metrics():
     """Aggregate success rates vs cost per agent."""
     agents = ["claude", "gemini", "codex", "grok"]
     results = {}
-    
+
     for agent in agents:
         rows = db.query_all(
             "MATCH (a:AgentNode {name: $a})<-[r:AFFINITY]-(t:TaskType) RETURN sum(r.score), sum(r.count)",
-            {"a": agent}
+            {"a": agent},
         )
         score_sum = rows[0][0] if rows and rows[0][0] is not None else 0
         total_uses = rows[0][1] if rows and rows[0][1] is not None else 0
-        
+
         fail_rows = db.query_all(
             "MATCH (a:AgentNode {name: $a})-[r:FAILED_BECAUSE]->(e:ErrorType) RETURN sum(r.count)",
-            {"a": agent}
+            {"a": agent},
         )
-        total_fails = fail_rows[0][0] if fail_rows and fail_rows[0][0] is not None else 0
-        
+        total_fails = (
+            fail_rows[0][0] if fail_rows and fail_rows[0][0] is not None else 0
+        )
+
         results[agent] = {
-            "success_rate": (total_uses - total_fails) / total_uses if total_uses > 0 else 1.0,
+            "success_rate": (total_uses - total_fails) / total_uses
+            if total_uses > 0
+            else 1.0,
             "avg_affinity": score_sum / total_uses if total_uses > 0 else 0.5,
             "total_calls": total_uses,
-            "failure_count": total_fails
+            "failure_count": total_fails,
         }
-    
+
     return results
 
 
@@ -233,19 +258,30 @@ async def doctor():
     except Exception as e:
         add("graph_db", False, str(e))
 
-    add("memory_service", _port_open("localhost", 3111),
-        "port 3111 " + ("open" if _port_open("localhost", 3111) else "closed"))
+    add(
+        "memory_service",
+        _port_open("localhost", 3111),
+        "port 3111 " + ("open" if _port_open("localhost", 3111) else "closed"),
+    )
 
     # Per-agent install + auth
     for key in AGENT_ORDER:
         spec = AGENTS[key]
-        installed = _is_installed(key)
-        add(f"agent:{key}:installed", installed,
-            spec.display if installed else f"missing — install: {spec.npm_pkg or 'pending CLI'}")
+        installed = is_installed_anywhere(key)
+        add(
+            f"agent:{key}:installed",
+            installed,
+            spec.display
+            if installed
+            else f"missing — install: {spec.npm_pkg or 'pending CLI'}",
+        )
         if installed and spec.auth_check:
             authed = is_authenticated(key)
-            add(f"agent:{key}:auth", authed is True,
-                "signed in" if authed is True else "not signed in or unknown")
+            add(
+                f"agent:{key}:auth",
+                authed is True,
+                "signed in" if authed is True else "not signed in or unknown",
+            )
 
     failed = [c for c in checks if not c["ok"]]
     return {
@@ -265,8 +301,8 @@ async def get_roles():
     return ROLE_DESCRIPTIONS
 
 
-
 # ── v1 API (Unified Gateway) ──────────────────────────────────────────────────
+
 
 @app.post("/v1/prompt")
 async def v1_prompt(request: ChatRequest):
@@ -294,21 +330,21 @@ async def export_snapshot(project_id: str = "default"):
         {"name": row[0], "type": row[1], "description": row[2], "confidence": row[3]}
         for row in db.query_all(
             "MATCH (e:Entity) WHERE e.project_id = $pid RETURN e.name, e.type, e.description, e.confidence",
-            {"pid": project_id}
+            {"pid": project_id},
         )
     ]
     relationships = [
         {"source": row[0], "target": row[1], "type": row[2], "confidence": row[3]}
         for row in db.query_all(
             "MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) WHERE a.project_id = $pid RETURN a.name, b.name, r.type, r.confidence",
-            {"pid": project_id}
+            {"pid": project_id},
         )
     ]
     return {
         "project_id": project_id,
         "timestamp": _time.time(),
         "entities": entities,
-        "relationships": relationships
+        "relationships": relationships,
     }
 
 
@@ -320,8 +356,8 @@ class _PermissionRequestBody(BaseModel):
 
 
 class _PermissionDecision(BaseModel):
-    behavior: str           # allow | deny | stop
-    scope: str = "once"    # once | session
+    behavior: str  # allow | deny | stop
+    scope: str = "once"  # once | session
     message: Optional[str] = None
     updated_input: Optional[dict] = None
 
@@ -342,19 +378,28 @@ async def permission_wait(request_id: str):
 
 @app.post("/permission/{request_id}/decide")
 async def permission_decide(request_id: str, body: _PermissionDecision):
-    ok = broker.decide(request_id, body.behavior, body.scope, body.message, body.updated_input)
+    ok = broker.decide(
+        request_id, body.behavior, body.scope, body.message, body.updated_input
+    )
     if not ok:
-        raise HTTPException(status_code=404, detail="Unknown or already decided request")
+        raise HTTPException(
+            status_code=404, detail="Unknown or already decided request"
+        )
     return {"status": "ok"}
 
 
-def _stream_agent(agent_name: str, full_prompt: str, request: "ChatRequest", perm_q, tag: str = "primary"):
+def _stream_agent(
+    agent_name: str,
+    full_prompt: str,
+    request: "ChatRequest",
+    perm_q,
+    tag: str = "primary",
+):
     """
     Stream one agent's response. Yields text chunks + handles quota and logic errors.
     Returns (full_response, t_first, t3, t4) via a closure — caller collects via list.
     """
-    from backend.models import ErrorType
-    
+
     agent = agent_factory.get_agent(agent_name)
     t3 = _time.perf_counter()
     t_first_box = [None]
@@ -364,7 +409,9 @@ def _stream_agent(agent_name: str, full_prompt: str, request: "ChatRequest", per
 
     def _run_agent() -> None:
         try:
-            for chunk in agent.execute_stream(full_prompt, request.cwd, session_id=request.session_id):
+            for chunk in agent.execute_stream(
+                full_prompt, request.cwd, session_id=request.session_id
+            ):
                 chunk_q.put(("chunk", chunk))
         except Exception as exc:
             chunk_q.put(("error", exc))
@@ -393,34 +440,41 @@ def _stream_agent(agent_name: str, full_prompt: str, request: "ChatRequest", per
         elif kind == "error":
             e = val
             error_msg = str(e)
-            
+
             # Categorize error (Causal Taxonomy)
             etype = ErrorType.UNKNOWN
             if "AGENT_TRANSIENT_ERROR" in error_msg:
                 etype = ErrorType.TRANSIENT_CAPACITY
-            elif "context length" in error_msg.lower() or "too many tokens" in error_msg.lower():
+            elif (
+                "context length" in error_msg.lower()
+                or "too many tokens" in error_msg.lower()
+            ):
                 etype = ErrorType.CONTEXT_OVERFLOW
             elif "syntax" in error_msg.lower() or "lint" in error_msg.lower():
                 etype = ErrorType.LINTER_ERROR
-            
+
             db.log_agent_failure(agent_name, etype.value)
-            
+
             if etype == ErrorType.TRANSIENT_CAPACITY:
                 yield f"\n⚠️  {agent_name} is temporarily overloaded (429 Capacity). Please try again in a few seconds.\n"
             else:
                 yield f"\n❌ {agent_name} failed ({etype.value}): {e}\n"
-                
+
                 # Deterministic Rollback (Consensus Round 3)
                 context_cache.prune_by_tag(request.session_id, tag)
-                
+
                 fallback = agent_router.get_fallback(agent_name, etype)
                 if fallback:
                     yield f"🔄 Rollback & Fallback: Switching to {fallback}...\n"
                     # Re-run with the fallback agent
-                    yield from _stream_agent(fallback, full_prompt, request, None, tag="fallback")
+                    yield from _stream_agent(
+                        fallback, full_prompt, request, None, tag="fallback"
+                    )
                 else:
                     # Log failure to affinity
-                    agent_router.update_outcome(request.task_type, agent_name, success=False)
+                    agent_router.update_outcome(
+                        request.task_type, agent_name, success=False
+                    )
 
         else:  # "chunk"
             chunk = val
@@ -433,12 +487,16 @@ def _stream_agent(agent_name: str, full_prompt: str, request: "ChatRequest", per
     t4 = _time.perf_counter()
     full_response = "".join(response_chunks)
 
-    if full_response.strip() and not agent_done: # Success
-         agent_router.update_outcome(request.task_type, agent_name, success=True)
+    if full_response.strip() and not agent_done:  # Success
+        agent_router.update_outcome(request.task_type, agent_name, success=True)
 
     memory_client.store(
         content=f"User: {request.prompt}\nAssistant: {full_response[:500]}",
-        metadata={"session_id": request.session_id, "agent": agent_name, "cwd": request.cwd},
+        metadata={
+            "session_id": request.session_id,
+            "agent": agent_name,
+            "cwd": request.cwd,
+        },
         tier="episodic",
     )
     if full_response.strip():
@@ -468,23 +526,34 @@ async def chat(request: ChatRequest):
         )
 
     # STEP 2: Route — may return multiple agents for fan-out requests
-    agent_names = agent_router.route_multi(request.task_type, request.prompt, request.preferred_agent)
+    agent_names = agent_router.route_multi(
+        request.task_type, request.prompt, request.preferred_agent
+    )
     t2 = _time.perf_counter()
 
     if agent_names == ["none"]:
-        raise HTTPException(status_code=503, detail="No agents available (not installed or authenticated).")
+        raise HTTPException(
+            status_code=503,
+            detail="No agents available (not installed or authenticated).",
+        )
 
     full_prompt = injected_context + request.prompt
     is_fanout = len(agent_names) > 1
     # Parallel if explicitly requested OR natural language signals it
-    run_parallel = request.parallel or (is_fanout and agent_router.detect_parallel(request.prompt))
+    run_parallel = request.parallel or (
+        is_fanout and agent_router.detect_parallel(request.prompt)
+    )
 
     def _sep(name: str) -> str:
         s = "━" * 60
         return f"\n{s}\n◆  {name.upper()}\n{s}\n"
 
     def cli_generator():
-        if request.preferred_agent and agent_names[0] != request.preferred_agent and not is_fanout:
+        if (
+            request.preferred_agent
+            and agent_names[0] != request.preferred_agent
+            and not is_fanout
+        ):
             yield f"⚠️  {request.preferred_agent} unavailable. Routing to {agent_names[0]}.\n"
 
         for agent_name in agent_names:
@@ -502,7 +571,9 @@ async def chat(request: ChatRequest):
                 chunks: list[str] = []
                 t_json = ""
                 # For parallel, we tag each branch uniquely
-                for item in _stream_agent(ag, full_prompt, request, None, tag=f"branch_{ag}"):
+                for item in _stream_agent(
+                    ag, full_prompt, request, None, tag=f"branch_{ag}"
+                ):
                     if item.startswith("\n__TIMING__:"):
                         t_json = item
                     else:
@@ -528,7 +599,9 @@ async def chat(request: ChatRequest):
                 tag = "primary" if i == 0 else "critic"
                 if is_fanout:
                     yield _sep(agent_name)
-                yield from _stream_agent(agent_name, full_prompt, request, perm_q, tag=tag)
+                yield from _stream_agent(
+                    agent_name, full_prompt, request, perm_q, tag=tag
+                )
                 if is_fanout and i < len(agent_names) - 1:
                     yield "\n"
 
@@ -554,6 +627,7 @@ async def debate(request: DebateRequest):
 
 
 # ── memory endpoints ──────────────────────────────────────────────────────────
+
 
 @app.post("/memory/entities")
 async def add_entity(entity: Entity):
@@ -581,7 +655,9 @@ async def get_graph():
     ]
     relationships = [
         {"source": row[0], "target": row[1], "type": row[2]}
-        for row in db.query_all("MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) RETURN a.name, b.name, r.type")
+        for row in db.query_all(
+            "MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) RETURN a.name, b.name, r.type"
+        )
     ]
     return {"entities": entities, "relationships": relationships}
 
@@ -601,6 +677,7 @@ async def query_memory(query: dict):
 async def clear_session(session_id: str = "default"):
     """Reset context cache for a session — next message gets full context again."""
     from backend.context_cache import context_cache
+
     context_cache.invalidate(session_id)
     return {"status": "cleared", "session_id": session_id}
 
@@ -608,9 +685,8 @@ async def clear_session(session_id: str = "default"):
 @app.get("/session/stats")
 async def session_stats(session_id: str = "default"):
     from backend.context_cache import context_cache
+
     return context_cache.stats(session_id)
-
-
 
 
 if __name__ == "__main__":

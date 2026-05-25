@@ -22,28 +22,28 @@ def register(scraper: "BaseScraper") -> None:
 
 
 def strip_ansi(s: str) -> str:
-    s = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', s)
-    s = re.sub(r'\x1b[()][A-Z0-9]', '', s)
-    s = re.sub(r'\x1b.', '', s)
-    s = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]', '', s)
-    return s.replace('\r\n', '\n').replace('\r', '\n')
+    s = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", s)
+    s = re.sub(r"\x1b[()][A-Z0-9]", "", s)
+    s = re.sub(r"\x1b.", "", s)
+    s = re.sub(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]", "", s)
+    return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
 # Sync intervals (seconds) keyed by the string returned by BaseScraper.detect_model()
 SYNC_INTERVALS: dict[str | None, int] = {
     # Claude
-    "opus":          2 * 60,
-    "sonnet":       10 * 60,
-    "haiku":        30 * 60,
+    "opus": 2 * 60,
+    "sonnet": 10 * 60,
+    "haiku": 30 * 60,
     # Gemini
-    "gemini ultra":  2 * 60,
-    "gemini pro":    5 * 60,
+    "gemini ultra": 2 * 60,
+    "gemini pro": 5 * 60,
     "gemini flash": 15 * 60,
-    "gemini nano":  30 * 60,
+    "gemini nano": 30 * 60,
     # Codex
-    "codex":        30 * 60,
+    "codex": 30 * 60,
     # Fallback
-    None:           30 * 60,
+    None: 30 * 60,
 }
 
 

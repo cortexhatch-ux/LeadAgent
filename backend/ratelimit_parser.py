@@ -18,7 +18,7 @@ _TRANSIENT_SIGNALS = [
 ]
 
 _WEEKLY_SIGNALS = ["weekly", "week"]
-_DAILY_SIGNALS  = ["daily", "day", "hour", "today"]
+_DAILY_SIGNALS = ["daily", "day", "hour", "today"]
 
 
 def extract_usage_hint(text: str) -> dict:
@@ -49,14 +49,18 @@ def extract_usage_hint(text: str) -> dict:
 
     # "55% of your weekly limit" / "55% weekly"
     weekly = re.search(r"(\d+(?:\.\d+)?)\s*%[^.\n]{0,80}week", text, re.IGNORECASE)
-    daily  = re.search(r"(\d+(?:\.\d+)?)\s*%[^.\n]{0,80}(?:day|daily|hour)", text, re.IGNORECASE)
+    daily = re.search(
+        r"(\d+(?:\.\d+)?)\s*%[^.\n]{0,80}(?:day|daily|hour)", text, re.IGNORECASE
+    )
     if weekly:
         result["weekly_pct"] = float(weekly.group(1))
     if daily:
         result["daily_pct"] = float(daily.group(1))
 
     # "12 messages remaining out of 50"
-    msg = re.search(r"(\d+)\s+messages?\s+remaining(?:\s+out\s+of\s+(\d+))?", text, re.IGNORECASE)
+    msg = re.search(
+        r"(\d+)\s+messages?\s+remaining(?:\s+out\s+of\s+(\d+))?", text, re.IGNORECASE
+    )
     if msg and "daily_pct" not in result:
         remaining = int(msg.group(1))
         total = int(msg.group(2)) if msg.group(2) else None
@@ -66,12 +70,13 @@ def extract_usage_hint(text: str) -> dict:
     # "resets in 3h 22m" / "resets in 45 minutes" / "resets in 2 hours"
     reset = re.search(
         r"reset[s]?\s+in\s+(?:(\d+)\s*h(?:ours?)?\s*)?(?:(\d+)\s*m(?:inutes?)?)?",
-        text, re.IGNORECASE
+        text,
+        re.IGNORECASE,
     )
     if reset and (reset.group(1) or reset.group(2)):
         hours = int(reset.group(1) or 0)
-        mins  = int(reset.group(2) or 0)
-        secs  = hours * 3600 + mins * 60
+        mins = int(reset.group(2) or 0)
+        secs = hours * 3600 + mins * 60
         if secs > 0:
             result["reset_in_seconds"] = secs
 

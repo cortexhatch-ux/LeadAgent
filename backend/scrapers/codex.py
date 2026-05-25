@@ -9,6 +9,7 @@ import time
 
 try:
     import pexpect
+
     _PEXPECT_AVAILABLE = True
 except ImportError:
     _PEXPECT_AVAILABLE = False
@@ -19,7 +20,6 @@ from backend.agents import is_installed_anywhere, _build_argv
 
 
 class CodexScraper(BaseScraper):
-
     @property
     def name(self) -> str:
         return "codex"
@@ -30,8 +30,11 @@ class CodexScraper(BaseScraper):
         try:
             argv = _build_argv("codex", [], tty=True)
             child = pexpect.spawn(
-                argv[0], args=argv[1:],
-                timeout=20, encoding="utf-8", echo=False,
+                argv[0],
+                args=argv[1:],
+                timeout=20,
+                encoding="utf-8",
+                echo=False,
                 dimensions=(80, 200),
             )
             time.sleep(6)

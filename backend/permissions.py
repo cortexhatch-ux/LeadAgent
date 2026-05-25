@@ -60,18 +60,24 @@ class PermissionBroker:
                 return fp.rsplit("/", 1)[0] or fp
         return ""
 
-    def is_allowed(self, session_id: str, agent: str, tool_name: str, input_: Dict[str, Any]) -> bool:
+    def is_allowed(
+        self, session_id: str, agent: str, tool_name: str, input_: Dict[str, Any]
+    ) -> bool:
         key = (session_id, agent, tool_name, self._fingerprint(tool_name, input_))
         with self._lock:
             return self._allow_cache.get(key, False)
 
-    def remember_allow(self, session_id: str, agent: str, tool_name: str, input_: Dict[str, Any]) -> None:
+    def remember_allow(
+        self, session_id: str, agent: str, tool_name: str, input_: Dict[str, Any]
+    ) -> None:
         key = (session_id, agent, tool_name, self._fingerprint(tool_name, input_))
         with self._lock:
             self._allow_cache[key] = True
 
     # ── request lifecycle ──────────────────────────────────────────────────
-    def create(self, session_id: str, agent: str, tool_name: str, input_: Dict[str, Any]) -> PermissionRequest:
+    def create(
+        self, session_id: str, agent: str, tool_name: str, input_: Dict[str, Any]
+    ) -> PermissionRequest:
         pr = PermissionRequest(
             id=uuid.uuid4().hex,
             session_id=session_id,
@@ -109,7 +115,9 @@ class PermissionBroker:
                 "behavior": behavior,
                 "scope": scope,
                 "message": message,
-                "updatedInput": updated_input if updated_input is not None else pr.input,
+                "updatedInput": updated_input
+                if updated_input is not None
+                else pr.input,
             }
         if behavior == "allow" and scope == "session":
             self.remember_allow(pr.session_id, pr.agent, pr.tool_name, pr.input)

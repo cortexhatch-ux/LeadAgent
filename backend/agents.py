@@ -5,27 +5,27 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
-from backend.agents_catalog import AGENTS
 
-_ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+_ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _PROJECT_ROOT = str(Path(__file__).parent.parent.absolute())
 
 _CLI_MAP = {
     "claude": "claude",
     "gemini": "gemini",
-    "codex":  "codex",
-    "grok":   "grok",
+    "codex": "codex",
+    "grok": "grok",
 }
 
 _CONTAINER_MAP = {
     "claude": "leadagent-claude",
     "gemini": "leadagent-gemini",
-    "codex":  "leadagent-codex",
-    "grok":   "leadagent-grok",
+    "codex": "leadagent-codex",
+    "grok": "leadagent-grok",
 }
 
 
@@ -36,7 +36,9 @@ def _container_running(container: str) -> bool:
     try:
         res = subprocess.run(
             ["docker", "inspect", "-f", "{{.State.Running}}", container],
-            capture_output=True, text=True, timeout=2
+            capture_output=True,
+            text=True,
+            timeout=2,
         )
         return res.stdout.strip() == "true"
     except Exception:
@@ -49,11 +51,11 @@ def is_installed_anywhere(cli: str) -> bool:
         container = _CONTAINER_MAP.get(cli)
         if container:
             return _container_running(container)
-    
+
     # Native check
     if shutil.which(cli):
         return True
-    
+
     # Check extra common paths (copied from main.py for consistency)
     extra_paths = [
         os.path.expanduser("~/.local/bin"),
@@ -65,7 +67,9 @@ def is_installed_anywhere(cli: str) -> bool:
     return any(os.path.isfile(os.path.join(d, cli)) for d in extra_paths)
 
 
-def _build_argv(cli: str, args: list[str], cwd: str = ".", tty: bool = False) -> list[str]:
+def _build_argv(
+    cli: str, args: list[str], cwd: str = ".", tty: bool = False
+) -> list[str]:
     """
     Return the command argv to run `cli args`.
     Uses `docker exec` when Docker mode is active and the container is up,
@@ -82,10 +86,7 @@ def _build_argv(cli: str, args: list[str], cwd: str = ".", tty: bool = False) ->
             if not os.path.isabs(cwd):
                 abs_cwd = os.path.join("/app/leadagent-data", cwd)
             # Host temp paths (macOS /var/folders) aren't mounted in containers.
-            _MOUNTED_PREFIXES = [
-                "/app/leadagent-data",
-                os.path.expanduser("~")
-            ]
+            _MOUNTED_PREFIXES = ["/app/leadagent-data", os.path.expanduser("~")]
             workspace = os.environ.get("LEADAGENT_WORKSPACE")
             if workspace:
                 _MOUNTED_PREFIXES.append(workspace)
@@ -95,6 +96,7 @@ def _build_argv(cli: str, args: list[str], cwd: str = ".", tty: bool = False) ->
             flags = ["-it"] if tty else ["-i"]
             return ["docker", "exec"] + flags + ["-w", abs_cwd, container, cli] + args
     return [cli] + args
+
 
 # Prompts larger than this are passed via stdin to avoid OS ARG_MAX limits
 _ARG_MAX = 100_000
@@ -116,7 +118,13 @@ class CLIAgent:
     def __init__(self, command: str):
         self.command = command
 
-    def execute_stream(self, prompt: str, cwd: str = ".", session_id: str = "default", simple: bool = False) -> Generator[str, None, None]:
+    def execute_stream(
+        self,
+        prompt: str,
+        cwd: str = ".",
+        session_id: str = "default",
+        simple: bool = False,
+    ) -> Generator[str, None, None]:
         use_stdin = len(prompt) > _ARG_MAX
         stdin_data = None
 
@@ -126,14 +134,20 @@ class CLIAgent:
 
         if self.command == "gemini":
             if use_stdin:
-                command_args = _build_argv(self.command, ["--skip-trust", "--approval-mode", "plan"], cwd=cwd)
+                command_args = _build_argv(
+                    self.command, ["--skip-trust", "--approval-mode", "plan"], cwd=cwd
+                )
                 stdin_data = prompt
             else:
-                command_args = _build_argv(self.command, ["-p", prompt, "--skip-trust", "--approval-mode", "plan"], cwd=cwd)
+                command_args = _build_argv(
+                    self.command,
+                    ["-p", prompt, "--skip-trust", "--approval-mode", "plan"],
+                    cwd=cwd,
+                )
         elif self.command == "codex":
             # Use 'exec --json' for robust non-interactive parsing.
             flags = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
-            
+
             # Use positional arguments for small prompts (more reliable, avoids stdin noise).
             # Fall back to stdin only for very large prompts.
             if len(prompt) < _ARG_MAX:
@@ -142,7 +156,7 @@ class CLIAgent:
             else:
                 command_args = _build_argv(self.command, flags, cwd=cwd)
                 stdin_data = prompt
-            
+
             yield from self._execute_jsonl_stream(command_args, stdin_data, cwd)
             return
         elif self.command == "grok":
@@ -182,10 +196,12 @@ class CLIAgent:
 
             full_output = []
             for raw_line in process.stdout:
-                line = _ANSI_RE.sub('', raw_line)
+                line = _ANSI_RE.sub("", raw_line)
                 full_output.append(line)
                 stripped = line.strip()
-                if stripped and not any(stripped.startswith(p) for p in _SUPPRESS_PREFIXES):
+                if stripped and not any(
+                    stripped.startswith(p) for p in _SUPPRESS_PREFIXES
+                ):
                     yield line
 
             process.wait()
@@ -200,6 +216,7 @@ class CLIAgent:
         self, command_args: list[str], stdin_data: str | None, cwd: str
     ) -> Generator[str, None, None]:
         """Generic JSONL event stream parser (used by Codex and others)."""
+
         def find_text(obj: Any) -> Generator[str, None, None]:
             """Recursively find any 'text' or 'content' fields in the JSON event."""
             if isinstance(obj, dict):
@@ -224,12 +241,12 @@ class CLIAgent:
         env.setdefault("COLORTERM", "truecolor")
 
         local_cwd = cwd if os.path.isdir(cwd) else None
-        # Only pipe stdin if we actually have data to send. 
+        # Only pipe stdin if we actually have data to send.
         # Otherwise, some CLIs (like codex) might hang waiting for input.
         process = subprocess.Popen(
             command_args,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, # Silence CLI noise (like "Reading from stdin...")
+            stderr=subprocess.DEVNULL,  # Silence CLI noise (like "Reading from stdin...")
             stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
             text=True,
             bufsize=0,
@@ -246,12 +263,14 @@ class CLIAgent:
                 raw = raw_line.rstrip("\n")
                 if not raw:
                     continue
-                
+
                 # Check if it's JSONL. If not (e.g. a startup warning), skip it.
                 if not raw.startswith("{"):
                     # Still check for suppression list even for non-JSON lines
                     stripped = raw.strip()
-                    if stripped and not any(stripped.startswith(p) for p in _SUPPRESS_PREFIXES):
+                    if stripped and not any(
+                        stripped.startswith(p) for p in _SUPPRESS_PREFIXES
+                    ):
                         yield raw_line
                     continue
 
@@ -289,9 +308,13 @@ class CLIAgent:
             mcp_path = fh.name
 
         stream_flags = [
-            "--output-format", "stream-json", "--verbose",
-            "--mcp-config", mcp_path,
-            "--permission-prompt-tool", "mcp__leadagent_perm__ask_permission",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--mcp-config",
+            mcp_path,
+            "--permission-prompt-tool",
+            "mcp__leadagent_perm__ask_permission",
         ]
 
         if use_stdin:
@@ -309,13 +332,20 @@ class CLIAgent:
         process = subprocess.Popen(
             command_args,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,  # keep stderr separate from JSON stdout
+            stderr=subprocess.PIPE,  # Capture stderr for diagnostics
             stdin=subprocess.PIPE if use_stdin else None,
             text=True,
             bufsize=0,
             cwd=local_cwd,
             env=env,
         )
+
+        def _log_stderr():
+            for line in process.stderr:
+                if line.strip():
+                    print(f"[Claude CLI Stderr]: {line.strip()}")
+
+        threading.Thread(target=_log_stderr, daemon=True).start()
 
         try:
             if use_stdin and stdin_data:
@@ -326,9 +356,13 @@ class CLIAgent:
                 raw = raw_line.rstrip("\n")
                 if not raw:
                     continue
+
                 try:
                     event = json.loads(raw)
                 except json.JSONDecodeError:
+                    # Non-JSON output (like startup info or warnings)
+                    if raw.strip():
+                        print(f"[Claude CLI]: {raw}")
                     continue
 
                 etype = event.get("type")
@@ -348,10 +382,15 @@ class CLIAgent:
                             yield text
                 elif etype == "result" and event.get("subtype") == "error":
                     err = str(event.get("result", "")).lower()
+                    print(f"[Claude CLI Error]: {err}")
                     if "rate limit" in err or "overloaded" in err or "529" in err:
                         raise Exception("AGENT_TRANSIENT_ERROR")
                     raise Exception(f"Agent error: {err}")
 
+        except Exception as e:
+            if str(e) != "AGENT_TRANSIENT_ERROR":
+                print(f"[_execute_claude_stream] Exception: {e}")
+            raise e
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -363,7 +402,11 @@ class CLIAgent:
                     pass
 
         if process.returncode not in (0, None, 1):
-            raise Exception(f"Agent failed with exit code {process.returncode}")
+            # Read any remaining stderr
+            err_out = process.stderr.read().strip()
+            raise Exception(
+                f"Agent failed with exit code {process.returncode}. Stderr: {err_out}"
+            )
 
 
 class AgentFactory:

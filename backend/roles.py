@@ -39,11 +39,11 @@ ROLES: dict[str, str] = {
 }
 
 ROLE_DESCRIPTIONS: dict[str, str] = {
-    "general":   "Default balanced mode",
-    "coding":    "Write minimal, correct code — no explanations",
-    "reviewer":  "Security, perf, and best-practice code review",
-    "debugger":  "Root-cause analysis and minimal fixes",
-    "research":  "Thorough structured analysis",
+    "general": "Default balanced mode",
+    "coding": "Write minimal, correct code — no explanations",
+    "reviewer": "Security, perf, and best-practice code review",
+    "debugger": "Root-cause analysis and minimal fixes",
+    "research": "Thorough structured analysis",
     "architect": "System design, trade-offs, and failure modes",
 }
 

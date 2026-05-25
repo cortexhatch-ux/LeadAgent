@@ -2,11 +2,13 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from enum import Enum
 
+
 class Entity(BaseModel):
     name: str
     type: str
     description: Optional[str] = None
     properties: Dict[str, Any] = {}
+
 
 class Relationship(BaseModel):
     source: str
@@ -15,9 +17,11 @@ class Relationship(BaseModel):
     description: Optional[str] = None
     properties: Dict[str, Any] = {}
 
+
 class MemoryState(BaseModel):
     entities: List[Entity]
     relationships: List[Relationship]
+
 
 class ErrorType(str, Enum):
     LINTER_ERROR = "LinterError"

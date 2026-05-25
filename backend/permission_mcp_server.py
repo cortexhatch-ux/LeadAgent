@@ -12,8 +12,8 @@ import sys
 import requests
 
 BACKEND_URL = os.environ.get("LEADAGENT_BACKEND_URL", "http://localhost:8000")
-SESSION_ID  = os.environ.get("LEADAGENT_SESSION_ID",  "default")
-AGENT_NAME  = os.environ.get("LEADAGENT_AGENT_NAME",  "claude")
+SESSION_ID = os.environ.get("LEADAGENT_SESSION_ID", "default")
+AGENT_NAME = os.environ.get("LEADAGENT_AGENT_NAME", "claude")
 
 _TOOLS = [
     {
@@ -22,9 +22,18 @@ _TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "tool_name":   {"type": "string", "description": "Name of the tool being invoked"},
-                "input":       {"type": "object", "description": "Arguments the tool would receive"},
-                "tool_use_id": {"type": "string", "description": "Opaque ID from the caller"},
+                "tool_name": {
+                    "type": "string",
+                    "description": "Name of the tool being invoked",
+                },
+                "input": {
+                    "type": "object",
+                    "description": "Arguments the tool would receive",
+                },
+                "tool_use_id": {
+                    "type": "string",
+                    "description": "Opaque ID from the caller",
+                },
             },
             "required": ["tool_name"],
         },
@@ -39,18 +48,20 @@ def _send(obj: dict) -> None:
 
 def _handle(msg: dict) -> None:
     method = msg.get("method", "")
-    id_    = msg.get("id")
+    id_ = msg.get("id")
 
     if method == "initialize":
-        _send({
-            "jsonrpc": "2.0",
-            "id": id_,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "leadagent_perm", "version": "1.0"},
-            },
-        })
+        _send(
+            {
+                "jsonrpc": "2.0",
+                "id": id_,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "leadagent_perm", "version": "1.0"},
+                },
+            }
+        )
 
     elif method == "notifications/initialized":
         pass  # notification — no response
@@ -60,37 +71,41 @@ def _handle(msg: dict) -> None:
 
     elif method == "tools/call":
         params = msg.get("params", {})
-        name   = params.get("name", "")
-        args   = params.get("arguments", {})
+        name = params.get("name", "")
+        args = params.get("arguments", {})
         if name == "ask_permission":
             _ask_permission(id_, args)
         else:
-            _send({
-                "jsonrpc": "2.0",
-                "id": id_,
-                "error": {"code": -32601, "message": f"Unknown tool: {name}"},
-            })
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": id_,
+                    "error": {"code": -32601, "message": f"Unknown tool: {name}"},
+                }
+            )
 
     elif id_ is not None:
-        _send({
-            "jsonrpc": "2.0",
-            "id": id_,
-            "error": {"code": -32601, "message": f"Unknown method: {method}"},
-        })
+        _send(
+            {
+                "jsonrpc": "2.0",
+                "id": id_,
+                "error": {"code": -32601, "message": f"Unknown method: {method}"},
+            }
+        )
 
 
 def _ask_permission(id_: object, args: dict) -> None:
     tool_name = args.get("tool_name", "")
-    input_    = args.get("input", {})
+    input_ = args.get("input", {})
 
     try:
         resp = requests.post(
             f"{BACKEND_URL}/permission/_request",
             json={
                 "session_id": SESSION_ID,
-                "agent":      AGENT_NAME,
-                "tool_name":  tool_name,
-                "input":      input_,
+                "agent": AGENT_NAME,
+                "tool_name": tool_name,
+                "input": input_,
             },
             timeout=5,
         )
@@ -111,21 +126,26 @@ def _ask_permission(id_: object, args: dict) -> None:
     behavior = decision.get("behavior", "deny")
 
     if behavior == "allow":
-        payload = {"behavior": "allow", "updatedInput": decision.get("updatedInput", input_)}
+        payload = {
+            "behavior": "allow",
+            "updatedInput": decision.get("updatedInput", input_),
+        }
     else:
         payload = {
             "behavior": "deny",
-            "message":  decision.get("message") or "User denied the request.",
+            "message": decision.get("message") or "User denied the request.",
         }
 
-    _send({
-        "jsonrpc": "2.0",
-        "id": id_,
-        "result": {
-            "content": [{"type": "text", "text": json.dumps(payload)}],
-            "isError": False,
-        },
-    })
+    _send(
+        {
+            "jsonrpc": "2.0",
+            "id": id_,
+            "result": {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "isError": False,
+            },
+        }
+    )
 
 
 def main() -> None:

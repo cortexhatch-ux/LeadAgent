@@ -6,18 +6,20 @@ import os
 
 # Expected reset windows per agent. Claude Pro resets daily usage every ~8h in practice.
 RESET_INTERVALS = {
-    "claude": {"daily": 8 * 3600,  "weekly": 7 * 86400},
+    "claude": {"daily": 8 * 3600, "weekly": 7 * 86400},
     "gemini": {"daily": 24 * 3600, "weekly": 7 * 86400},
-    "codex":  {"daily": 24 * 3600, "weekly": 7 * 86400},
-    "grok":   {"daily": 24 * 3600, "weekly": 7 * 86400},
+    "codex": {"daily": 24 * 3600, "weekly": 7 * 86400},
+    "grok": {"daily": 24 * 3600, "weekly": 7 * 86400},
 }
 
 
 class AgentQuota(BaseModel):
     exhausted: bool = False
-    exhausted_at: Optional[float] = None   # Unix ts when we detected exhaustion
-    reset_at: Optional[float] = None       # Unix ts of expected reset (may be exact from CLI output)
-    limit_type: Optional[str] = None       # "daily" or "weekly"
+    exhausted_at: Optional[float] = None  # Unix ts when we detected exhaustion
+    reset_at: Optional[float] = (
+        None  # Unix ts of expected reset (may be exact from CLI output)
+    )
+    limit_type: Optional[str] = None  # "daily" or "weekly"
     real_daily_pct: Optional[float] = None
     real_weekly_pct: Optional[float] = None
 
@@ -42,7 +44,9 @@ class QuotaManager:
                         real_weekly_pct=entry.get("real_weekly_pct"),
                     )
                 else:
-                    known = {k: v for k, v in entry.items() if k in AgentQuota.model_fields}
+                    known = {
+                        k: v for k, v in entry.items() if k in AgentQuota.model_fields
+                    }
                     result[agent] = AgentQuota(**known)
             return result
         return {agent: AgentQuota() for agent in RESET_INTERVALS}
@@ -61,7 +65,9 @@ class QuotaManager:
         if state.reset_at:
             return max(0, int(state.reset_at - time.time()))
         if state.exhausted_at:
-            interval = RESET_INTERVALS.get(agent, {}).get(state.limit_type or "daily", 86400)
+            interval = RESET_INTERVALS.get(agent, {}).get(
+                state.limit_type or "daily", 86400
+            )
             return max(0, int((state.exhausted_at + interval) - time.time()))
         return None
 
@@ -82,7 +88,9 @@ class QuotaManager:
 
     # ── write methods ─────────────────────────────────────────────────────────
 
-    def set_exhausted(self, agent: str, exhausted: bool = True, limit_type: str = "daily"):
+    def set_exhausted(
+        self, agent: str, exhausted: bool = True, limit_type: str = "daily"
+    ):
         if agent not in self.state:
             return
         state = self.state[agent]
@@ -99,7 +107,9 @@ class QuotaManager:
             state.limit_type = None
         self._save_state()
 
-    def set_reset_from_cli(self, agent: str, reset_in_seconds: int, limit_type: str = "daily"):
+    def set_reset_from_cli(
+        self, agent: str, reset_in_seconds: int, limit_type: str = "daily"
+    ):
         """Use exact reset time parsed directly from CLI output."""
         if agent not in self.state:
             return
@@ -110,7 +120,12 @@ class QuotaManager:
         state.limit_type = limit_type
         self._save_state()
 
-    def sync_real_usage(self, agent: str, daily_pct: Optional[float] = None, weekly_pct: Optional[float] = None) -> list[str]:
+    def sync_real_usage(
+        self,
+        agent: str,
+        daily_pct: Optional[float] = None,
+        weekly_pct: Optional[float] = None,
+    ) -> list[str]:
         alerts = []
         if agent not in self.state:
             return alerts
@@ -124,14 +139,18 @@ class QuotaManager:
         if daily_pct is not None:
             state.real_daily_pct = daily_pct
             if daily_pct >= 80 and old_daily < 80:
-                alerts.append(f"⚠️  {agent} daily quota reached {daily_pct:.0f}% (80% threshold)")
+                alerts.append(
+                    f"⚠️  {agent} daily quota reached {daily_pct:.0f}% (80% threshold)"
+                )
             if daily_pct >= 100:
                 is_currently_exhausted = True
 
         if weekly_pct is not None:
             state.real_weekly_pct = weekly_pct
             if weekly_pct >= 80 and old_weekly < 80:
-                alerts.append(f"⚠️  {agent} weekly quota reached {weekly_pct:.0f}% (80% threshold)")
+                alerts.append(
+                    f"⚠️  {agent} weekly quota reached {weekly_pct:.0f}% (80% threshold)"
+                )
             if weekly_pct >= 100:
                 is_currently_exhausted = True
 
@@ -143,9 +162,13 @@ class QuotaManager:
                 state.exhausted_at = None
                 state.reset_at = None
                 state.limit_type = None
-                print(f"[QuotaManager] {agent} exhaustion cleared via real usage sync (Daily: {daily_pct}%, Weekly: {weekly_pct}%)")
+                print(
+                    f"[QuotaManager] {agent} exhaustion cleared via real usage sync (Daily: {daily_pct}%, Weekly: {weekly_pct}%)"
+                )
         elif is_currently_exhausted and not state.exhausted:
-            self.set_exhausted(agent, True, "daily" if (daily_pct or 0) >= 100 else "weekly")
+            self.set_exhausted(
+                agent, True, "daily" if (daily_pct or 0) >= 100 else "weekly"
+            )
 
         self._save_state()
         return alerts
@@ -174,7 +197,9 @@ class QuotaManager:
             else:
                 h, rem = divmod(remaining, 3600)
                 m = rem // 60
-                lines.append(f"  {agent} ({state.limit_type or 'daily'} limit): resets in {h}h {m:02d}m")
+                lines.append(
+                    f"  {agent} ({state.limit_type or 'daily'} limit): resets in {h}h {m:02d}m"
+                )
         return "\n".join(lines) if lines else "All agents available."
 
 

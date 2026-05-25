@@ -40,11 +40,20 @@ LeadAgent uses a **Dual-Path** architecture—it adapts to your environment auto
 *   **Mode B: Native (Zero Containers)** - If Docker is stopped, it runs natively on your host.
 
 ```bash
-# Start/Restart the backend (detects mode automatically)
+# Start the backend in the background (RECOMMENDED)
+./start_backend.sh --daemon
+
+# Start in the foreground (for debugging)
 ./start_backend.sh
 
 # Re-run onboarding wizard
 leadagent --onboarding
+```
+
+#### Monitoring & Logs
+When running in `--daemon` mode, output is redirected to the logs. You can monitor the "Brain" in real-time:
+```bash
+tail -f leadagent-data/daemon.log
 ```
 
 ### 4. Basic Usage

@@ -17,6 +17,7 @@ from backend.scrapers.gemini import GeminiScraper
 
 # ── per-provider sync ─────────────────────────────────────────────────────────
 
+
 def sync_provider(name: str, quota_manager) -> dict:
     scraper = SCRAPERS.get(name)
     if not scraper:
@@ -43,14 +44,17 @@ def sync_provider(name: str, quota_manager) -> dict:
 def sync_claude_usage(quota_manager) -> dict:
     return sync_provider("claude", quota_manager)
 
+
 def sync_gemini_usage(quota_manager) -> dict:
     return sync_provider("gemini", quota_manager)
+
 
 def sync_codex_usage(quota_manager) -> dict:
     return sync_provider("codex", quota_manager)
 
 
 # ── adaptive monitor ──────────────────────────────────────────────────────────
+
 
 class UsageMonitor:
     """
@@ -98,12 +102,12 @@ class UsageMonitor:
     def status(self) -> dict:
         due_in = max(0, int(self.last_sync_at + self.sync_interval - time.time()))
         return {
-            "models":          dict(self._models),
-            "claude_model":    self.claude_model,
-            "gemini_model":    self.gemini_model,
+            "models": dict(self._models),
+            "claude_model": self.claude_model,
+            "gemini_model": self.gemini_model,
             "sync_interval_s": self.sync_interval,
-            "next_sync_in_s":  due_in,
-            "last_sync_at":    self.last_sync_at or None,
+            "next_sync_in_s": due_in,
+            "last_sync_at": self.last_sync_at or None,
         }
 
     # ── internals ─────────────────────────────────────────────────────────────
@@ -117,8 +121,7 @@ class UsageMonitor:
 
     def _compute_interval(self) -> int:
         return min(
-            self._interval_for(name, model)
-            for name, model in self._models.items()
+            self._interval_for(name, model) for name, model in self._models.items()
         )
 
     def _dominant_provider(self) -> str:
@@ -148,7 +151,7 @@ class UsageMonitor:
         print("[UsageMonitor] starting — reading usage files from provider daemons...")
         all_data = self._sync_all()
         self.sync_interval = self._compute_interval()
-        self.last_sync_at  = time.time()
+        self.last_sync_at = time.time()
 
         lines = ["[UsageMonitor] ┌─ startup usage report ──────────────────"]
         for name, data in all_data.items():
@@ -157,10 +160,14 @@ class UsageMonitor:
                 s = data.get("session_pct", "?")
                 w = data.get("weekly_pct", "?")
                 r = data.get("session_resets", "")
-                lines.append(f"[UsageMonitor] │  Claude : {model}  session {s}%  weekly {w}%  {r}")
+                lines.append(
+                    f"[UsageMonitor] │  Claude : {model}  session {s}%  weekly {w}%  {r}"
+                )
             else:
                 q = data.get("quota_pct", "?")
-                lines.append(f"[UsageMonitor] │  {name.capitalize()} : {model}  quota {q}%")
+                lines.append(
+                    f"[UsageMonitor] │  {name.capitalize()} : {model}  quota {q}%"
+                )
         lines.append(
             f"[UsageMonitor] │  Sync interval: every {self.sync_interval // 60}min"
             f"  (driven by: {self._dominant_provider()})"
@@ -181,7 +188,7 @@ class UsageMonitor:
                     )
                     self._sync_all()
                     self.sync_interval = self._compute_interval()
-                    self.last_sync_at  = time.time()
+                    self.last_sync_at = time.time()
             except Exception as e:
                 print(f"[UsageMonitor] loop error: {e}")
 

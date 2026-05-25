@@ -30,7 +30,6 @@ def _usage_dir() -> Path:
 
 
 class UsageFileReader:
-
     @staticmethod
     def read(provider: str) -> dict:
         """
@@ -48,7 +47,9 @@ class UsageFileReader:
 
         age = time.time() - data.get("captured_at", 0)
         if age > STALE_AFTER:
-            print(f"[UsageFileReader] {provider}: data is {age/3600:.1f}h old — ignoring")
+            print(
+                f"[UsageFileReader] {provider}: data is {age / 3600:.1f}h old — ignoring"
+            )
             return {}
 
         return data

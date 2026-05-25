@@ -1,19 +1,17 @@
 import re
-import threading
 from typing import Optional
 
 from backend.db import db
 from backend.memory_client import memory_client
 from backend.context_cache import context_cache
 from backend.agents_catalog import enabled_agents, is_authenticated
-import shutil
 
 # All agents are subscription CLIs
 _CLI_MAP = {
     "claude": "claude",
     "gemini": "gemini",
-    "codex":  "codex",
-    "grok":   "grok",
+    "codex": "codex",
+    "grok": "grok",
 }
 
 
@@ -23,18 +21,19 @@ def _cli_available(agent: str) -> bool:
         return False
     # In Docker mode the CLI lives in a sibling container — trust is_installed_anywhere()
     from backend.agents import is_installed_anywhere
+
     return is_installed_anywhere(agent)
 
 
 # ── Rule-based task classifier (no API call, no quota spend) ─────────────────
 
 _TASK_PATTERNS = {
-    "coding":        r'\b(code|function|class|method|def |bug|fix|refactor|implement|debug|test|compile|syntax|variable|loop|algorithm|api|sql|json|yaml|exception|import|module|library|framework|deploy|dockerfile|script)\b',
-    "deep_analysis": r'\b(analyze|analyse|review|audit|security|performance|architecture|evaluate|assess|critique|deep.dive|trade.?off|bottleneck)\b',
-    "research":      r'\b(what is|explain|how does|why|when did|history|compare|difference|overview|describe|tell me about|who is|where is|background)\b',
-    "long_context":  r'\b(summarize|summarise|entire|full file|whole file|all of|document|codebase|transcript|paste)\b',
-    "creative":      r'\b(write a|create a|generate|draft|compose|story|poem|blog|essay|marketing|copy)\b',
-    "logic":         r'\b(solve|calculate|math|proof|prove|equation|formula|logic|reasoning|puzzle|optimise|optimize)\b',
+    "coding": r"\b(code|function|class|method|def |bug|fix|refactor|implement|debug|test|compile|syntax|variable|loop|algorithm|api|sql|json|yaml|exception|import|module|library|framework|deploy|dockerfile|script)\b",
+    "deep_analysis": r"\b(analyze|analyse|review|audit|security|performance|architecture|evaluate|assess|critique|deep.dive|trade.?off|bottleneck)\b",
+    "research": r"\b(what is|explain|how does|why|when did|history|compare|difference|overview|describe|tell me about|who is|where is|background)\b",
+    "long_context": r"\b(summarize|summarise|entire|full file|whole file|all of|document|codebase|transcript|paste)\b",
+    "creative": r"\b(write a|create a|generate|draft|compose|story|poem|blog|essay|marketing|copy)\b",
+    "logic": r"\b(solve|calculate|math|proof|prove|equation|formula|logic|reasoning|puzzle|optimise|optimize)\b",
 }
 
 
@@ -45,19 +44,20 @@ def _classify_task(prompt: str) -> tuple[str, str]:
         n = len(re.findall(pattern, lower))
         if n > best_n:
             best, best_n = task, n
-    
+
     complexity = "low"
     if best_n > 5:
         complexity = "high"
     elif best_n > 2:
         complexity = "medium"
-    
+
     return best, complexity
 
 
 from backend.models import ErrorType
 
 # ── AgentRouter ───────────────────────────────────────────────────────────────
+
 
 class AgentRouter:
     # Fallback Directed Acyclic Graph: specifies backups for specific failure modes.
@@ -77,18 +77,20 @@ class AgentRouter:
     strengths = {
         "claude": ["coding", "logic", "nuance", "deep_analysis"],
         "gemini": ["research", "long_context"],
-        "codex":  ["coding", "logic"],
-        "grok":   ["research", "creative", "general"],
+        "codex": ["coding", "logic"],
+        "grok": ["research", "creative", "general"],
     }
 
-    def _get_best_affinity_agent(self, task_type: str, available_agents: list[str]) -> Optional[str]:
+    def _get_best_affinity_agent(
+        self, task_type: str, available_agents: list[str]
+    ) -> Optional[str]:
         """Query KuzuDB for the agent with the highest affinity score for this task type."""
         try:
             rows = db.query_all(
                 "MATCH (t:TaskType {name: $t})-[r:AFFINITY]->(a:AgentNode) "
                 "WHERE a.name IN $available "
                 "RETURN a.name, r.score ORDER BY r.score DESC LIMIT 1",
-                {"t": task_type, "available": available_agents}
+                {"t": task_type, "available": available_agents},
             )
             if rows:
                 return rows[0][0]
@@ -104,8 +106,10 @@ class AgentRouter:
     def check_memory(self, prompt: str, session_id: str = "default") -> Optional[str]:
         # ── Semantic memory ───────────────────────────────────────────────────
         semantic_results = memory_client.search(prompt, limit=3)
-        all_snippets     = [r["content"] for r in semantic_results] if semantic_results else []
-        new_snippets     = context_cache.filter_memory(session_id, all_snippets)
+        all_snippets = (
+            [r["content"] for r in semantic_results] if semantic_results else []
+        )
+        new_snippets = context_cache.filter_memory(session_id, all_snippets)
 
         # ── Graph: matched entities ───────────────────────────────────────────
         all_entity_rows = db.query_all(
@@ -113,8 +117,10 @@ class AgentRouter:
             {"prompt": prompt},
         )
         new_entity_rows = context_cache.filter_entities(session_id, all_entity_rows)
-        entity_names    = [row[0] for row in all_entity_rows]   # all — for relationship + QA lookup
-        new_names       = {row[0] for row in new_entity_rows}
+        entity_names = [
+            row[0] for row in all_entity_rows
+        ]  # all — for relationship + QA lookup
+        {row[0] for row in new_entity_rows}
 
         # ── Graph: 1-hop relationships (only from new entities) ───────────────
         all_rel_rows = []
@@ -142,9 +148,11 @@ class AgentRouter:
         all_file_rows = db.query_all(
             "MATCH (f:File) WHERE $prompt CONTAINS f.name OR $prompt CONTAINS f.path "
             "RETURN f.path, f.name, f.extension LIMIT 5",
-            {"prompt": prompt}
+            {"prompt": prompt},
         )
-        new_file_rows = context_cache.filter_entities(session_id + ":files", all_file_rows)
+        new_file_rows = context_cache.filter_entities(
+            session_id + ":files", all_file_rows
+        )
 
         # ── Build context blocks from new-only items ──────────────────────────
         combined = []
@@ -153,12 +161,14 @@ class AgentRouter:
             combined.append("[RELEVANT MEMORIES]\n" + "\n".join(new_snippets))
 
         entity_lines = [f"  {r[0]} ({r[1]}): {r[2]}" for r in new_entity_rows if r[2]]
-        rel_lines    = [
+        rel_lines = [
             f"  {r[1]} ({r[2]}){' — ' + r[3] if r[3] else ''} [via {r[4]}]"
             for r in new_rel_rows
         ]
         if entity_lines or rel_lines:
-            combined.append("[PROJECT KNOWLEDGE]\n" + "\n".join(entity_lines + rel_lines))
+            combined.append(
+                "[PROJECT KNOWLEDGE]\n" + "\n".join(entity_lines + rel_lines)
+            )
 
         if new_qa_rows:
             qa_lines = [f"  Q: {r[0]}\n  A ({r[2]}): {r[1]}" for r in new_qa_rows]
@@ -166,7 +176,9 @@ class AgentRouter:
 
         if new_file_rows:
             file_lines = [f"  {r[0]}" for r in new_file_rows]
-            combined.append("[PROJECT STRUCTURE (Matched Files)]\n" + "\n".join(file_lines))
+            combined.append(
+                "[PROJECT STRUCTURE (Matched Files)]\n" + "\n".join(file_lines)
+            )
 
         if not combined:
             return None
@@ -181,13 +193,19 @@ class AgentRouter:
         )
 
         skipped = (
-            len(all_entity_rows) - len(new_entity_rows)
-            + len(all_rel_rows)  - len(new_rel_rows)
-            + len(all_qa_rows)   - len(new_qa_rows)
-            + len(all_snippets)  - len(new_snippets)
+            len(all_entity_rows)
+            - len(new_entity_rows)
+            + len(all_rel_rows)
+            - len(new_rel_rows)
+            + len(all_qa_rows)
+            - len(new_qa_rows)
+            + len(all_snippets)
+            - len(new_snippets)
         )
         if skipped:
-            print(f"[ContextCache] session={session_id} skipped {skipped} already-injected blocks")
+            print(
+                f"[ContextCache] session={session_id} skipped {skipped} already-injected blocks"
+            )
 
         return "\n\n".join(combined)
 
@@ -198,37 +216,40 @@ class AgentRouter:
         """
         try:
             text = f"{prompt} {answer}"
-            technical = set(re.findall(
-                r'\b[A-Z][a-zA-Z]{2,}\b'              # CamelCase identifiers
-                r'|\b\w+\.(?:py|js|go|ts|json|yaml)\b'  # filenames
-                r'|\b[a-z]+_[a-z_]{2,}\b',            # snake_case names
-                text,
-            ))
+            technical = set(
+                re.findall(
+                    r"\b[A-Z][a-zA-Z]{2,}\b"  # CamelCase identifiers
+                    r"|\b\w+\.(?:py|js|go|ts|json|yaml)\b"  # filenames
+                    r"|\b[a-z]+_[a-z_]{2,}\b",  # snake_case names
+                    text,
+                )
+            )
             entities = [t for t in technical if 3 < len(t) < 60][:12]
+
+            # Store the question first to get a stable ID
+            qid = db.add_question(prompt, answer[:500], agent)
 
             for name in entities:
                 db.add_entity(name, "extracted", "")
-
-            qid = db.add_question(prompt, answer[:500], agent)
-            for name in entities:
                 db.link_question_to_entity(qid, name)
+
         except Exception as e:
             print(f"[learn_from_prompt] {e}")
 
     _KNOWN_AGENTS = ("claude", "gemini", "codex", "grok")
 
     _AGENT_INTENT_RE = re.compile(
-        r'\b(?:use|ask|with|via|switch to|route to|send to|have|let|get|want)\s+(claude|gemini|codex|grok)\b'
-        r'|\bi\s+want\s+(claude|gemini|codex|grok)\s+to\b'
-        r'|\b(claude|gemini|codex|grok)\s+(?:please|should|can you|to)\b',
+        r"\b(?:use|ask|with|via|switch to|route to|send to|have|let|get|want)\s+(claude|gemini|codex|grok)\b"
+        r"|\bi\s+want\s+(claude|gemini|codex|grok)\s+to\b"
+        r"|\b(claude|gemini|codex|grok)\s+(?:please|should|can you|to)\b",
         re.IGNORECASE,
     )
 
     # Phrases that imply fan-out to multiple agents
     _MULTI_AGENT_RE = re.compile(
-        r'\b(?:both|all|each|compare|versus|vs\.?|side.by.side)\b'
-        r'|\band\s+(?:claude|gemini|codex|grok)\b'
-        r'|\b(?:claude|gemini|codex|grok)\s+and\b',
+        r"\b(?:both|all|each|compare|versus|vs\.?|side.by.side)\b"
+        r"|\band\s+(?:claude|gemini|codex|grok)\b"
+        r"|\b(?:claude|gemini|codex|grok)\s+and\b",
         re.IGNORECASE,
     )
 
@@ -238,7 +259,11 @@ class AgentRouter:
         Returns multiple agents when fan-out intent is detected,
         a single-item list for single-agent intent, or [] for auto-routing.
         """
-        named = [a for a in self._KNOWN_AGENTS if re.search(rf'\b{a}\b', prompt, re.IGNORECASE)]
+        named = [
+            a
+            for a in self._KNOWN_AGENTS
+            if re.search(rf"\b{a}\b", prompt, re.IGNORECASE)
+        ]
 
         if len(named) >= 2 and self._MULTI_AGENT_RE.search(prompt):
             return named  # fan-out
@@ -267,15 +292,17 @@ class AgentRouter:
                 return fallback
         return None
 
-    def route_multi(self, task_type: str, prompt: str = "", preferred_agent: str = None) -> list[str]:
+    def route_multi(
+        self, task_type: str, prompt: str = "", preferred_agent: str = None
+    ) -> list[str]:
         """
         Like route() but returns a list. Multiple agents = fan-out request.
         Single agent = [agent]. No match = [auto-routed agent].
         """
         available = [
-            a for a in enabled_agents()
-            if _cli_available(a)
-            and is_authenticated(a) is not False
+            a
+            for a in enabled_agents()
+            if _cli_available(a) and is_authenticated(a) is not False
         ]
         if not available:
             return ["none"]
@@ -317,14 +344,16 @@ class AgentRouter:
         return f"[{agent}] matched: complexity={complexity}, task={task_type}"
 
     _PARALLEL_RE = re.compile(
-        r'\b(?:parallel|simultaneously|concurrently|at the same time|side.by.side)\b',
+        r"\b(?:parallel|simultaneously|concurrently|at the same time|side.by.side)\b",
         re.IGNORECASE,
     )
 
     def detect_parallel(self, prompt: str) -> bool:
         return bool(self._PARALLEL_RE.search(prompt))
 
-    def route(self, task_type: str, prompt: str = "", preferred_agent: str = None) -> str:
+    def route(
+        self, task_type: str, prompt: str = "", preferred_agent: str = None
+    ) -> str:
         """Single-agent routing — returns first result from route_multi."""
         return self.route_multi(task_type, prompt, preferred_agent)[0]
 

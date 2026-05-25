@@ -9,6 +9,7 @@ import time
 
 try:
     import pexpect
+
     _PEXPECT_AVAILABLE = True
 except ImportError:
     _PEXPECT_AVAILABLE = False
@@ -19,7 +20,6 @@ from backend.agents import is_installed_anywhere, _build_argv
 
 
 class GeminiScraper(BaseScraper):
-
     @property
     def name(self) -> str:
         return "gemini"
@@ -30,8 +30,11 @@ class GeminiScraper(BaseScraper):
         try:
             argv = _build_argv("gemini", [], tty=True)
             child = pexpect.spawn(
-                argv[0], args=argv[1:],
-                timeout=20, encoding="utf-8", echo=False,
+                argv[0],
+                args=argv[1:],
+                timeout=20,
+                encoding="utf-8",
+                echo=False,
                 dimensions=(80, 200),
             )
             time.sleep(6)
@@ -53,7 +56,8 @@ class GeminiScraper(BaseScraper):
             result["quota_pct"] = float(m.group(1))
         model = re.search(
             r"no sandbox\s+(Auto\s*\([^)]+\)|Gemini[\w\s.]+?)\s+\d+%",
-            text, re.IGNORECASE,
+            text,
+            re.IGNORECASE,
         )
         if model:
             result["model"] = model.group(1).strip()

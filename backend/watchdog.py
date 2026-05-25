@@ -6,6 +6,7 @@ Native mode (launchd):  called every 30s via StartInterval, uses launchctl to re
 Docker mode (detected automatically): runs in a loop via docker-compose, uses the
   Docker Unix socket API to restart the backend container — no docker CLI needed.
 """
+
 import json
 import os
 import shutil
@@ -23,7 +24,9 @@ BACKEND_CONTAINER = "leadagent-backend"
 # True when running inside a Docker container
 IN_DOCKER = os.path.exists("/.dockerenv")
 
-HEALTH_URL = "http://backend:8000/health" if IN_DOCKER else "http://localhost:8000/health"
+HEALTH_URL = (
+    "http://backend:8000/health" if IN_DOCKER else "http://localhost:8000/health"
+)
 AGENTMEMORY_PORT = 3111
 MAX_FAILURES = 3
 DOCKER_SOCK = "/var/run/docker.sock"
@@ -56,6 +59,7 @@ def port_open(port: int, host: str = "localhost", timeout: float = 1.0) -> bool:
 
 
 # ── Restart strategies ───────────────────────────────────────────────────────
+
 
 def restart_via_docker_socket():
     """Restart the backend container via Docker Unix socket — no CLI needed."""
@@ -93,9 +97,13 @@ def restart_via_launchctl():
         log("Daemon restarted via launchctl kickstart.")
     else:
         log(f"kickstart failed ({result.stderr.strip()}), trying stop/start...")
-        subprocess.run(["launchctl", "stop", "com.leadagent.daemon"], capture_output=True)
+        subprocess.run(
+            ["launchctl", "stop", "com.leadagent.daemon"], capture_output=True
+        )
         time.sleep(3)
-        subprocess.run(["launchctl", "start", "com.leadagent.daemon"], capture_output=True)
+        subprocess.run(
+            ["launchctl", "start", "com.leadagent.daemon"], capture_output=True
+        )
         log("Daemon stop/start issued.")
 
 
@@ -107,6 +115,7 @@ def restart_daemon():
 
 
 # ── agentmemory (native-only — it manages its own Docker containers) ─────────
+
 
 def revive_agentmemory():
     if IN_DOCKER:
@@ -132,17 +141,22 @@ def revive_agentmemory():
 
 # ── Health check ─────────────────────────────────────────────────────────────
 
+
 def check_backend(state: dict) -> dict:
     import urllib.request
     import urllib.error
+
     try:
         with urllib.request.urlopen(HEALTH_URL, timeout=5) as resp:
             data = json.loads(resp.read().decode())
         status = data.get("status", "unknown")
         uptime = data.get("uptime_seconds", 0)
-        entities = data.get("components", {}).get("database", {}).get("entity_count", "?")
+        entities = (
+            data.get("components", {}).get("database", {}).get("entity_count", "?")
+        )
         agents_up = [
-            k for k, v in data.get("components", {}).get("agents", {}).items()
+            k
+            for k, v in data.get("components", {}).get("agents", {}).items()
             if v.get("available")
         ]
         log(
@@ -153,7 +167,9 @@ def check_backend(state: dict) -> dict:
             state["consecutive_failures"] = 0
         else:
             state["consecutive_failures"] += 1
-            log(f"Backend reported error status (failure #{state['consecutive_failures']})")
+            log(
+                f"Backend reported error status (failure #{state['consecutive_failures']})"
+            )
     except urllib.error.HTTPError as e:
         if e.code == 404:
             state["consecutive_failures"] = 0
@@ -174,7 +190,9 @@ def main():
     state = check_backend(state)
 
     if state["consecutive_failures"] >= MAX_FAILURES:
-        log(f"*** {state['consecutive_failures']} consecutive failures — restarting ***")
+        log(
+            f"*** {state['consecutive_failures']} consecutive failures — restarting ***"
+        )
         restart_daemon()
         state["consecutive_failures"] = 0
 
