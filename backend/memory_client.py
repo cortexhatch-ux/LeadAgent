@@ -21,9 +21,14 @@ class AgentMemoryClient:
                 json={"content": content, "metadata": metadata or {}, "tier": tier},
                 timeout=2.0,
             )
+            if response.status_code != 201:
+                print(f"[MemoryClient] store failed with status {response.status_code}: {response.text}")
             return response.status_code == 201
-        except Exception:
-            # Silent fail for store to avoid blocking main flow
+        except requests.exceptions.Timeout:
+            print("[MemoryClient] store timed out (transient)")
+            return False
+        except Exception as e:
+            print(f"[MemoryClient] store fatal error: {e}")
             return False
 
     def search(self, query: str, limit: int = 5):
@@ -34,9 +39,13 @@ class AgentMemoryClient:
             )
             if response.status_code == 200:
                 return response.json().get("results", [])
+            print(f"[MemoryClient] search failed with status {response.status_code}: {response.text}")
             return []
-        except Exception:
-            # Silent fail for search to avoid blocking main flow
+        except requests.exceptions.Timeout:
+            print("[MemoryClient] search timed out (transient)")
+            return []
+        except Exception as e:
+            print(f"[MemoryClient] search fatal error: {e}")
             return []
 
 

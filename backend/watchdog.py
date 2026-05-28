@@ -15,6 +15,12 @@ import subprocess
 import time
 from pathlib import Path
 
+try:
+    from backend.indexer import process_file, INDEX_EXTENSIONS
+    INDEXER_AVAILABLE = True
+except ImportError:
+    INDEXER_AVAILABLE = False
+
 PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "leadagent-data"
 STATE_FILE = DATA_DIR / "watchdog_state.json"
@@ -183,6 +189,56 @@ def check_backend(state: dict) -> dict:
     return state
 
 
+def run_indexer(state: dict):
+    """Scan for changed files and index them (Autonomous Indexer)."""
+    if not INDEXER_AVAILABLE:
+        return
+
+    workspace = os.environ.get("LEADAGENT_WORKSPACE")
+    if not workspace or not os.path.exists(workspace):
+        return
+
+    # Initialize hashes if missing
+    if "file_hashes" not in state:
+        state["file_hashes"] = {}
+
+    log(f"Scanning workspace for changes: {workspace}")
+
+    file_hashes = state["file_hashes"]
+    indexed_count = 0
+
+    # Simple walk-and-hash
+    for root, dirs, files in os.walk(workspace):
+        # Prune common ignore targets
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__', 'venv', 'leadagent')]
+
+        for f in files:
+            file_path = os.path.join(root, f)
+            ext = os.path.splitext(f)[1].lower()
+
+            if ext not in INDEX_EXTENSIONS:
+                continue
+
+            try:
+                mtime = os.path.getmtime(file_path)
+                if file_path not in file_hashes or mtime > file_hashes[file_path]:
+                    log(f"Change detected in {f}, indexing...")
+                    if process_file(file_path, project_id=workspace):
+                        file_hashes[file_path] = mtime
+                        indexed_count += 1
+            except Exception as e:
+                log(f"Failed to check/index {f}: {e}")
+
+            if indexed_count >= 3: # Throttle to avoid overloading Ollama
+                break
+
+        if indexed_count >= 3:
+            break
+
+    if indexed_count > 0:
+        log(f"Indexer batch complete: {indexed_count} files processed.")
+
+
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     state = load_state()
@@ -195,6 +251,9 @@ def main():
         )
         restart_daemon()
         state["consecutive_failures"] = 0
+
+    # ── Autonomous Indexer ──
+    run_indexer(state)
 
     mem_host = "host.docker.internal" if IN_DOCKER else "localhost"
     if not IN_DOCKER and not port_open(AGENTMEMORY_PORT):

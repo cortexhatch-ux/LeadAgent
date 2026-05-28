@@ -406,13 +406,19 @@ func isBackendUp() bool {
 }
 
 func ensureBackend() {
-	// Try up to 3 times before deciding it's actually offline
-	for i := 0; i < 3; i++ {
+	// Wait up to 30s — initial check (handles slow Docker networking)
+	for i := 0; i < 30; i++ {
 		if isBackendUp() {
 			return
 		}
-		time.Sleep(500 * time.Millisecond)
+		if i == 0 {
+			fmt.Printf("%s  Checking backend status...%s", Yellow, Reset)
+		} else {
+			fmt.Printf(".")
+		}
+		time.Sleep(1 * time.Second)
 	}
+	fmt.Printf("\n")
 
 	script := projectFile("start_backend.sh")
 	if _, err := os.Stat(script); err != nil {

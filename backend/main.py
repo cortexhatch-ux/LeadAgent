@@ -394,6 +394,7 @@ def _stream_agent(
     request: "ChatRequest",
     perm_q,
     tag: str = "primary",
+    mode: str = "plan",
 ):
     """
     Stream one agent's response. Yields text chunks + handles quota and logic errors.
@@ -405,12 +406,14 @@ def _stream_agent(
     t_first_box = [None]
     response_chunks = []
 
+    agent_done = False
+    agent_success = True
     chunk_q: _queue.Queue = _queue.Queue()
 
     def _run_agent() -> None:
         try:
             for chunk in agent.execute_stream(
-                full_prompt, request.cwd, session_id=request.session_id
+                full_prompt, request.cwd, session_id=request.session_id, mode=mode
             ):
                 chunk_q.put(("chunk", chunk))
         except Exception as exc:
@@ -438,6 +441,7 @@ def _stream_agent(
             agent_done = True
 
         elif kind == "error":
+            agent_success = False
             e = val
             error_msg = str(e)
 
@@ -468,7 +472,7 @@ def _stream_agent(
                     yield f"🔄 Rollback & Fallback: Switching to {fallback}...\n"
                     # Re-run with the fallback agent
                     yield from _stream_agent(
-                        fallback, full_prompt, request, None, tag="fallback"
+                        fallback, full_prompt, request, None, tag="fallback", mode=mode
                     )
                 else:
                     # Log failure to affinity
@@ -485,21 +489,21 @@ def _stream_agent(
             yield chunk
 
     t4 = _time.perf_counter()
-    full_response = "".join(response_chunks)
+    full_response = "".join(response_chunks).strip()
 
-    if full_response.strip() and not agent_done:  # Success
+    if agent_success and full_response:  # Success
         agent_router.update_outcome(request.task_type, agent_name, success=True)
 
-    memory_client.store(
-        content=f"User: {request.prompt}\nAssistant: {full_response[:500]}",
-        metadata={
-            "session_id": request.session_id,
-            "agent": agent_name,
-            "cwd": request.cwd,
-        },
-        tier="episodic",
-    )
-    if full_response.strip():
+    if full_response:
+        memory_client.store(
+            content=f"User: {request.prompt}\nAssistant: {full_response[:500]}",
+            metadata={
+                "session_id": request.session_id,
+                "agent": agent_name,
+                "cwd": request.cwd,
+            },
+            tier="episodic",
+        )
         threading.Thread(
             target=agent_router.learn_from_prompt,
             args=(request.prompt, full_response, agent_name),
@@ -526,7 +530,7 @@ async def chat(request: ChatRequest):
         )
 
     # STEP 2: Route — may return multiple agents for fan-out requests
-    agent_names = agent_router.route_multi(
+    agent_names, metadata = agent_router.route_multi(
         request.task_type, request.prompt, request.preferred_agent
     )
     t2 = _time.perf_counter()
@@ -537,7 +541,13 @@ async def chat(request: ChatRequest):
             detail="No agents available (not installed or authenticated).",
         )
 
+    mode = metadata.get("mode", "plan")
+    reasoning = metadata.get("internal_reasoning")
+    
     full_prompt = injected_context + request.prompt
+    if reasoning:
+        full_prompt = f"=== INTERNAL REASONING (DO NOT SHOW TO USER) ===\n{reasoning}\n=== END REASONING ===\n\n" + full_prompt
+
     is_fanout = len(agent_names) > 1
     # Parallel if explicitly requested OR natural language signals it
     run_parallel = request.parallel or (
@@ -560,11 +570,11 @@ async def chat(request: ChatRequest):
             yield f"↳ {agent_router.get_explanation(agent_name, request.prompt)}\n"
 
         perm_q = broker.session_queue(request.session_id)
+        result_buf: dict[str, str] = {}
+        timing_buf: dict[str, str] = {}
 
         if is_fanout and run_parallel:
             # ── Parallel fan-out: run all agents simultaneously, stream in completion order
-            result_buf: dict[str, str] = {}
-            timing_buf: dict[str, str] = {}
             done_q: _queue.Queue = _queue.Queue()
 
             def _buffer_one(ag: str) -> None:
@@ -572,7 +582,7 @@ async def chat(request: ChatRequest):
                 t_json = ""
                 # For parallel, we tag each branch uniquely
                 for item in _stream_agent(
-                    ag, full_prompt, request, None, tag=f"branch_{ag}"
+                    ag, full_prompt, request, None, tag=f"branch_{ag}", mode=mode
                 ):
                     if item.startswith("\n__TIMING__:"):
                         t_json = item
@@ -593,20 +603,49 @@ async def chat(request: ChatRequest):
                     yield timing_buf[ag]
                 yield "\n"
 
-        else:
-            # ── Sequential fan-out (default)
+        elif is_fanout:
+            # ── Sequential fan-out
             for i, agent_name in enumerate(agent_names):
                 tag = "primary" if i == 0 else "critic"
-                if is_fanout:
-                    yield _sep(agent_name)
-                yield from _stream_agent(
-                    agent_name, full_prompt, request, perm_q, tag=tag
-                )
-                if is_fanout and i < len(agent_names) - 1:
+                yield _sep(agent_name)
+                chunks = []
+                for item in _stream_agent(
+                    agent_name, full_prompt, request, perm_q, tag=tag, mode=mode
+                ):
+                    if not item.startswith("\n__TIMING__:"):
+                        yield item
+                        chunks.append(item)
+                    else:
+                        timing_buf[agent_name] = item
+                result_buf[agent_name] = "".join(chunks)
+                if i < len(agent_names) - 1:
                     yield "\n"
+        else:
+            # ── Single agent
+            yield from _stream_agent(
+                agent_names[0], full_prompt, request, perm_q, tag="primary", mode=mode
+            )
 
-        mode = "parallel" if (is_fanout and run_parallel) else "sequential"
-        yield f"\n__TIMING__:{json.dumps({'agents': agent_names, 'mode': mode, 'memory': _fmt_ms((t1 - t0) * 1000), 'routing': _fmt_ms((t2 - t1) * 1000), 'total': _fmt_ms((_time.perf_counter() - t0) * 1000)})}"
+        # ── Phase 1: Umpire Synthesis ──
+        if is_fanout and len(result_buf) > 1:
+            yield f"\n{'━' * 60}\n⚖️  UMPIRE SYNTHESIS\n{'━' * 60}\n"
+            synthesis_prompt = (
+                "You are the LeadAgent Umpire. Read the following different agent responses to the user prompt "
+                "and provide a single, unified, and cohesive final answer. Resolve any contradictions and "
+                "remove redundant information.\n\n"
+                f"Original Prompt: {request.prompt}\n\n"
+            )
+            for ag, res in result_buf.items():
+                synthesis_prompt += f"--- Result from {ag.upper()} ---\n{res}\n\n"
+
+            # Use a high-reasoning agent for synthesis
+            synth_agent = "claude" if "claude" in agent_names else agent_names[0]
+            yield from _stream_agent(
+                synth_agent, synthesis_prompt, request, None, tag="synthesis", mode=mode
+            )
+
+        run_mode = "parallel" if (is_fanout and run_parallel) else "sequential"
+        yield f"\n__TIMING__:{json.dumps({'agents': agent_names, 'mode': run_mode, 'memory': _fmt_ms((t1 - t0) * 1000), 'routing': _fmt_ms((t2 - t1) * 1000), 'total': _fmt_ms((_time.perf_counter() - t0) * 1000)})}"
 
     return StreamingResponse(cli_generator(), media_type="text/plain")
 
@@ -660,6 +699,36 @@ async def get_graph():
         )
     ]
     return {"entities": entities, "relationships": relationships}
+
+
+@app.get("/memory/graph/d3")
+async def get_graph_d3():
+    """Format graph for D3/vis.js (Phase 2)."""
+    entities = db.query_all("MATCH (e:Entity) RETURN e.name, e.type")
+    files = db.query_all("MATCH (f:File) RETURN f.path, f.name")
+
+    nodes = []
+    # Add Entity nodes
+    for name, etype in entities:
+        nodes.append({"id": name, "label": name, "group": "entity", "type": etype})
+
+    # Add File nodes
+    for path, name in files:
+        nodes.append({"id": path, "label": name, "group": "file", "title": path})
+
+    edges = []
+    # RELATED_TO edges
+    rel_rows = db.query_all("MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) RETURN a.name, b.name, r.type")
+    for src, tgt, rtype in rel_rows:
+        edges.append({"from": src, "to": tgt, "label": rtype})
+
+    # FS edges
+    fs_rows = db.query_all("MATCH (a)-[r:CONTAINS]->(b) RETURN a.path, b.path")
+    for src, tgt in fs_rows:
+        if src and tgt:
+            edges.append({"from": src, "to": tgt, "dashes": True, "color": "gray"})
+
+    return {"nodes": nodes, "edges": edges}
 
 
 @app.post("/memory/query")

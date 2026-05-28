@@ -7,6 +7,7 @@ DASHBOARD_HTML = """
     <title>LeadAgent Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Fira+Code:wght@400;500&display=swap');
         body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #f8fafc; }
@@ -31,6 +32,20 @@ DASHBOARD_HTML = """
                 Daemon Connected
             </div>
         </header>
+
+        <!-- Knowledge Graph Map (Phase 2) -->
+        <div class="card p-5 mb-8">
+            <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center gap-2 text-slate-400">
+                    <i data-lucide="network" class="w-4 h-4"></i>
+                    <h2 class="text-sm font-semibold uppercase tracking-wider">Knowledge Graph (Real-time)</h2>
+                </div>
+                <button onclick="refreshGraph()" class="text-slate-500 hover:text-white transition">
+                    <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                </button>
+            </div>
+            <div id="knowledge-graph" class="h-[400px] w-full bg-slate-900/50 rounded-lg border border-slate-700/50"></div>
+        </div>
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div class="card p-5">
@@ -88,15 +103,50 @@ DASHBOARD_HTML = """
                 const resp = await fetch('/health');
                 const data = await resp.json();
                 
-                // document.getElementById('uptime').textContent = formatSeconds(data.uptime_seconds);
-                // document.getElementById('entity-count').textContent = data.components.database.entity_count;
-                
                 updateQuotaGrid(data.components.agents, data.quotas);
                 updateAgentList(data.components.agents);
                 updateROI();
             } catch (err) {
                 console.error('Failed to fetch health:', err);
                 document.getElementById('connection-status').innerHTML = '<span class="w-2 h-2 rounded-full bg-red-500"></span> Disconnected';
+            }
+        }
+
+        let network = null;
+        async function refreshGraph() {
+            try {
+                const resp = await fetch('/memory/graph/d3');
+                const data = await resp.json();
+                
+                const container = document.getElementById('knowledge-graph');
+                const options = {
+                    nodes: {
+                        shape: 'dot',
+                        size: 16,
+                        font: { size: 12, color: '#f8fafc' },
+                        borderWidth: 2,
+                        shadow: true
+                    },
+                    edges: {
+                        width: 1,
+                        color: { inherit: 'from' },
+                        arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+                        smooth: { type: 'continuous' }
+                    },
+                    groups: {
+                        file: { color: { background: '#64748b', border: '#475569' }, shape: 'diamond' },
+                        entity: { color: { background: '#6366f1', border: '#4338ca' } }
+                    },
+                    physics: {
+                        enabled: true,
+                        stabilization: { iterations: 100 }
+                    }
+                };
+                
+                if (network) network.destroy();
+                network = new vis.Network(container, data, options);
+            } catch (err) {
+                console.error('Graph fetch failed:', err);
             }
         }
 
@@ -266,8 +316,10 @@ DASHBOARD_HTML = """
         lucide.createIcons();
         fetchData();
         refreshHistory();
+        refreshGraph();
         setInterval(fetchData, 5000);
         setInterval(refreshHistory, 30000);
+        setInterval(refreshGraph, 60000);
     </script>
 </body>
 </html>

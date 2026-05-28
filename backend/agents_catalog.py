@@ -90,9 +90,17 @@ AGENTS: dict[str, AgentSpec] = {
         auth_check=None,
         note="CLI not yet released by xAI",
     ),
+    "ollama": AgentSpec(
+        key="ollama",
+        display="Ollama (Local)",
+        vendor="Ollama",
+        color="#ffffff",
+        note="Local SLM runner. Requires Ollama to be running on port 11434.",
+        auth_check=["ollama", "list"],
+    ),
 }
 
-AGENT_ORDER = ("claude", "gemini", "codex", "grok")
+AGENT_ORDER = ("claude", "gemini", "codex", "grok", "ollama")
 
 
 _EXTRA_BIN_DIRS = [
@@ -141,6 +149,20 @@ def _container_running(agent_key: str) -> bool:
 
 
 def is_installed(agent_key: str) -> bool:
+    if agent_key == "ollama":
+        # For Ollama, we prioritize the REST API check since it's a service.
+        # Check both local and docker hosts.
+        from backend.agents import OllamaAgent
+        import requests
+        agent = OllamaAgent()
+        try:
+            # Quick probe to the /api/tags or version endpoint
+            resp = requests.get(f"{agent.url}/api/tags", timeout=0.5)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+
     if os.environ.get("LEADAGENT_DOCKER_MODE"):
         if _container_running(agent_key):
             return True
@@ -186,5 +208,7 @@ def is_authenticated(agent_key: str) -> Optional[bool]:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         blob = (out.stdout + out.stderr).lower()
         return any(tok in blob for tok in _AUTH_OK_TOKENS)
-    except Exception:
+    except Exception as e:
+        if os.environ.get("LEADAGENT_DEBUG"):
+            print(f"[is_authenticated] {agent_key} probe failed: {e}")
         return None
