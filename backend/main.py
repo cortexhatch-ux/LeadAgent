@@ -227,12 +227,12 @@ async def get_roi_metrics():
         )
 
         results[agent] = {
-            "success_rate": (total_uses - total_fails) / total_uses
+            "success_rate": float(total_uses - total_fails) / float(total_uses)
             if total_uses > 0
             else 1.0,
-            "avg_affinity": score_sum / total_uses if total_uses > 0 else 0.5,
-            "total_calls": total_uses,
-            "failure_count": total_fails,
+            "avg_affinity": float(score_sum) / float(total_uses) if total_uses > 0 else 0.5,
+            "total_calls": int(total_uses),
+            "failure_count": int(total_fails),
         }
 
     return results
@@ -311,7 +311,7 @@ async def get_roi():
         # This is a heuristic for visualization
         roi = {}
         for name, avg_score, total_count in rows:
-            success_rate = max(0.1, min(1.0, (avg_score + 1.0) / 2.0))
+            success_rate = max(0.1, min(1.0, (float(avg_score) + 1.0) / 2.0))
             roi[name] = {
                 "success_rate": success_rate,
                 "total_tasks": int(total_count)
