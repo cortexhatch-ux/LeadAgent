@@ -27,9 +27,9 @@ if [ ! -z "$PIDS" ]; then
     done
 fi
 
-# 2. Safety sweep for ports (8000 for FastAPI, 3111 for AgentMemory)
+# 2. Safety sweep for ports (8000 for FastAPI, 3111 for AgentMemory, 11434 for Ollama)
 # Only kill if the process on that port is tagged as ours
-for port in 8000 3111; do
+for port in 8000 3111 11434; do
     PIDS=$(lsof -ti :$port || true)
     if [ ! -z "$PIDS" ]; then
         for PID in $PIDS; do
@@ -60,22 +60,46 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 export LEADAGENT_WORKSPACE="$WORKSPACE"
 
-# ── Docker mode (preferred — no system file writes required) ─────────────────
-if [ "$FORCE_NATIVE" = false ] && docker info &>/dev/null; then
-    echo "🐳 Docker is running — starting LeadAgent via Docker Compose..."
-    echo "   Workspace mirrored: $LEADAGENT_WORKSPACE"
+# ── Service Launchers ─────────────────────────────────────────────────────────
 
-    # agentmemory runs natively (it manages its own Docker containers)
+start_agentmemory() {
     if command -v agentmemory &>/dev/null; then
         if ! nc -z localhost 3111 2>/dev/null; then
             echo "   Starting agentmemory server..."
-            # Launch with tag
             env LEADAGENT_TAG=true agentmemory serve --port 3111 --storage leadagent-data/memory &>leadagent-data/agentmemory.log &
         else
             echo "   agentmemory already running on port 3111."
         fi
     else
         echo "   agentmemory not found — context memory will be limited."
+    fi
+}
+
+start_ollama() {
+    if command -v ollama &>/dev/null; then
+        if ! nc -z localhost 11434 2>/dev/null; then
+            echo "   Starting Ollama server..."
+            # Launch with tag. 'ollama serve' is the standard way to start the background daemon.
+            env LEADAGENT_TAG=true ollama serve &>leadagent-data/ollama.log &
+            # Wait a moment for it to bind
+            sleep 2
+        else
+            echo "   Ollama already running on port 11434."
+        fi
+    else
+        echo "   Ollama not found on PATH. If it's the Mac App, please open it manually."
+    fi
+}
+
+# ── Docker mode (preferred — no system file writes required) ─────────────────
+if [ "$FORCE_NATIVE" = false ] && docker info &>/dev/null; then
+    echo "🐳 Docker is running — starting LeadAgent via Docker Compose..."
+    echo "   Workspace mirrored: $LEADAGENT_WORKSPACE"
+
+    start_agentmemory
+    # If using Docker, we let Docker Compose handle Ollama unless the user has it natively
+    if ! nc -z localhost 11434 2>/dev/null; then
+        echo "   Ollama not detected natively, will use Docker container..."
     fi
 
     docker compose up -d --build
@@ -93,13 +117,8 @@ export PYTHONPATH=$PYTHONPATH:.
 # Carry the user's full PATH so the backend can find CLIs (claude, gemini, etc.)
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-if command -v agentmemory &>/dev/null; then
-    echo "   Starting agentmemory server..."
-    # Launch with tag
-    env LEADAGENT_TAG=true agentmemory serve --port 3111 --storage leadagent-data/memory &>leadagent-data/agentmemory.log &
-else
-    echo "   agentmemory not found. Context memory will be limited."
-fi
+start_agentmemory
+start_ollama
 
 # Find the venv python — prefer ./leadagent, then legacy ./venv, fall back to system
 PYTHON=""

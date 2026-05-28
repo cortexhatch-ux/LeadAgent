@@ -22,8 +22,9 @@ services:
     volumes:
       - .:/app/leadagent-data
       - ${HOME}/.claude:/root/.claude
+      - /var/run/docker.sock:/var/run/docker.sock
       # Mirror host projects path
-      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+      - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     restart: unless-stopped
     stdin_open: true
     tty: true
@@ -42,10 +43,11 @@ services:
     volumes:
       - .:/app/leadagent-data
       - ${HOME}/.gemini:/root/.gemini
+      - /var/run/docker.sock:/var/run/docker.sock
       - ${HOME}/.config/google-chrome:/root/.config/google-chrome:ro
       - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
       # Mirror host projects path
-      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+      - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     restart: unless-stopped
     stdin_open: true
     tty: true
@@ -64,7 +66,7 @@ services:
     volumes:
       - .:/app/leadagent-data
       # Mirror host projects path
-      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+      - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     restart: unless-stopped
     stdin_open: true
     tty: true
@@ -83,7 +85,7 @@ services:
     volumes:
       - .:/app/leadagent-data
       # Mirror host projects path
-      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+      - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     restart: unless-stopped
     stdin_open: true
     tty: true
@@ -102,7 +104,7 @@ services:
       - .:/app/leadagent-data
       - /var/run/docker.sock:/var/run/docker.sock
       # Mirror host projects path
-      - ${LEADAGENT_WORKSPACE}:${LEADAGENT_WORKSPACE}
+      - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     environment:
       - PYTHONPATH=/app/leadagent-data
       - TERM=xterm-256color
@@ -136,14 +138,31 @@ services:
     volumes:
       - .:/app/leadagent-data
       - /var/run/docker.sock:/var/run/docker.sock
+      # Mirror host projects path
+      - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     environment:
       - PYTHONPATH=/app/leadagent-data
       - LEADAGENT_TAG=true
+      - LEADAGENT_WORKSPACE=${LEADAGENT_WORKSPACE}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     depends_on:
       - backend
+
+  # ── Local SLM (Ollama) ──────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: leadagent-ollama
+    labels:
+      - "com.leadagent.tag=true"
+    networks:
+      - leadagent-net
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./leadagent-data/ollama:/root/.ollama
+    restart: unless-stopped
 
 # NOTE — agentmemory is NOT included here.
 # Start it natively before docker compose up:  agentmemory serve --port 3111

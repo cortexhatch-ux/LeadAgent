@@ -11,6 +11,7 @@ Round flow:
 """
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterator
 
 from backend.agents import agent_factory
@@ -23,6 +24,9 @@ from backend.memory_client import memory_client
 _ROUND1 = """\
 You are participating in a structured multi-agent debate. Multiple AI agents \
 will argue about the following topic across {rounds} rounds.
+
+Topic:
+{prompt}
 
 Give your honest, thorough assessment. Take clear positions — hedging is \
 unhelpful here. Be specific: cite real risks, real opportunities, concrete examples.
@@ -98,12 +102,13 @@ No length limit — be thorough."""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-MARKER_ROUND = "── ROUND {round} ──"
-MARKER_AGENT = "┌─ Agent {agent} ─"
-MARKER_AGENT_END = "└───────────────"
-MARKER_UMPIRE = "── MODERATOR ──"
-MARKER_SYNTHESIS = "── FINAL SYNTHESIS ──"
-MARKER_DONE = "──────────────── Debate complete. ────────────────"
+MARKER_ROUND = "__DEBATE_ROUND__:{round}"
+MARKER_AGENT = "__DEBATE_AGENT__:{agent}"
+MARKER_AGENT_END = "__DEBATE_AGENT_END__:"
+MARKER_UMPIRE = "__DEBATE_UMPIRE__"
+MARKER_UMPIRE_END = "__DEBATE_UMPIRE_END__"
+MARKER_SYNTHESIS = "__DEBATE_SYNTHESIS__"
+MARKER_DONE = "__DEBATE_DONE__"
 
 
 def _fmt_history(
@@ -154,13 +159,12 @@ def run_debate(
 
     for r in range(1, rounds + 1):
         yield f"{MARKER_ROUND.format(round=r)}\n"
-        round_responses = []
 
+        # Build prompts for all debaters before spawning threads
+        prompts: dict[str, str] = {}
         for agent_name in active_debaters:
-            yield f"{MARKER_AGENT.format(agent=agent_name)}\n"
-
             if r == 1:
-                debate_prompt = _ROUND1.format(rounds=rounds, prompt=prompt)
+                prompts[agent_name] = _ROUND1.format(rounds=rounds, prompt=prompt)
             else:
                 other_positions = []
                 for idx, other_name in enumerate(active_debaters):
@@ -168,8 +172,7 @@ def run_debate(
                         other_positions.append(
                             f"Agent {other_name}: {history[-1][idx]}"
                         )
-
-                debate_prompt = _DEBATE.format(
+                prompts[agent_name] = _DEBATE.format(
                     round=r,
                     rounds=rounds,
                     prompt=prompt,
@@ -177,11 +180,27 @@ def run_debate(
                     umpire_question=umpire_questions[-1],
                 )
 
-            response = _run_sync(agent_name, debate_prompt, cwd)
-            round_responses.append(response)
+        # Run all debaters in parallel
+        responses: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=len(active_debaters)) as pool:
+            futures = {
+                pool.submit(_run_sync, name, prompts[name], cwd): name
+                for name in active_debaters
+            }
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    responses[name] = fut.result()
+                except Exception as e:
+                    responses[name] = f"[Agent error: {e}]"
 
-            yield response
+        # Emit in stable order so the UI is consistent round-to-round
+        round_responses = []
+        for agent_name in active_debaters:
+            yield f"{MARKER_AGENT.format(agent=agent_name)}\n"
+            yield responses[agent_name]
             yield f"\n{MARKER_AGENT_END}\n"
+            round_responses.append(responses[agent_name])
 
         history.append(round_responses)
 
@@ -204,19 +223,35 @@ def run_debate(
                 question = "What fundamental assumption in this debate hasn't been challenged yet?"
 
             umpire_questions.append(question)
-            yield f"❓ {question}\n\n"
+            yield f"❓ {question}\n"
+            yield f"{MARKER_UMPIRE_END}\n"
 
     # ── Synthesis ─────────────────────────────────────────────────────────────
     yield f"{MARKER_SYNTHESIS}\n"
 
     full_history = _fmt_history(history, active_debaters, umpire_questions)
 
+    # Run synthesis in parallel too
+    synth_prompts = {
+        name: _SYNTHESIS.format(rounds=rounds, prompt=prompt, history=full_history)
+        for name in active_debaters
+    }
+    synth_responses: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=len(active_debaters)) as pool:
+        futures = {
+            pool.submit(_run_sync, name, synth_prompts[name], cwd): name
+            for name in active_debaters
+        }
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                synth_responses[name] = fut.result()
+            except Exception as e:
+                synth_responses[name] = f"[Agent error: {e}]"
+
     for agent_name in active_debaters:
+        response = synth_responses[agent_name]
         yield f"{MARKER_AGENT.format(agent=agent_name)}\n"
-        synth_prompt = _SYNTHESIS.format(
-            rounds=rounds, prompt=prompt, history=full_history
-        )
-        response = _run_sync(agent_name, synth_prompt, cwd)
 
         # PERSISTENCE: Store synthesis in episodic memory and graph
         memory_client.store(
@@ -225,10 +260,8 @@ def run_debate(
             tier="episodic",
         )
 
-        # Add to graph as a high-confidence past discussion
         qid = db.add_question(f"[DEBATE] {prompt}", response, agent_name)
 
-        # Extraction logic (linked to entities for context search)
         try:
             text = f"{prompt} {response}"
             technical = set(
@@ -239,7 +272,7 @@ def run_debate(
                     text,
                 )
             )
-            entities = [t for t in technical if 3 < len(t) < 60][:12]
+            entities = [t for t in technical if 3 < len(t) < 60][:50]
             for name in entities:
                 db.add_entity(name, "extracted", "")
                 db.link_question_to_entity(qid, name)

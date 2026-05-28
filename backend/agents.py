@@ -47,6 +47,17 @@ def _container_running(container: str) -> bool:
 
 def is_installed_anywhere(cli: str) -> bool:
     """Check if CLI is installed locally OR if its container is running in Docker mode."""
+    if cli == "ollama":
+        from backend.agents import OllamaAgent
+        import requests
+        agent = OllamaAgent()
+        try:
+            resp = requests.get(f"{agent.url}/api/tags", timeout=0.5)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+
     if os.environ.get("LEADAGENT_DOCKER_MODE"):
         container = _CONTAINER_MAP.get(cli)
         if container:
@@ -118,60 +129,55 @@ class CLIAgent:
     def __init__(self, command: str):
         self.command = command
 
+    def _build_popen_args(self, prompt: str, cwd: str, mode: str) -> tuple[list[str], str | None, bool]:
+        """Return (args, stdin_data, use_stdin)."""
+        use_stdin = len(prompt) > _ARG_MAX
+        stdin_data = prompt if use_stdin else None
+        
+        if self.command == "gemini":
+            flags = ["--skip-trust", "--approval-mode", mode]
+            if not use_stdin:
+                flags = ["-p", prompt] + flags
+            return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
+
+        if self.command == "grok" or self.command not in ("claude", "gemini", "codex"):
+            flags = ["--print"]
+            if not use_stdin:
+                flags = ["--print", prompt]
+            return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
+            
+        return [], None, False
+
     def execute_stream(
         self,
         prompt: str,
         cwd: str = ".",
         session_id: str = "default",
         simple: bool = False,
+        mode: str = "plan",
     ) -> Generator[str, None, None]:
-        use_stdin = len(prompt) > _ARG_MAX
-        stdin_data = None
+        if self.command == "ollama":
+            # Ollama uses a REST API, not Popen
+            from backend.agents import OllamaAgent
+            yield from OllamaAgent().execute_stream(prompt, cwd, session_id, simple)
+            return
 
         if self.command == "claude" and not simple:
-            yield from self._execute_claude_stream(prompt, cwd, session_id, use_stdin)
+            yield from self._execute_claude_stream(prompt, cwd, session_id, len(prompt) > _ARG_MAX, mode)
             return
 
-        if self.command == "gemini":
-            if use_stdin:
-                command_args = _build_argv(
-                    self.command, ["--skip-trust", "--approval-mode", "plan"], cwd=cwd
-                )
-                stdin_data = prompt
-            else:
-                command_args = _build_argv(
-                    self.command,
-                    ["-p", prompt, "--skip-trust", "--approval-mode", "plan"],
-                    cwd=cwd,
-                )
-        elif self.command == "codex":
-            # Use 'exec --json' for robust non-interactive parsing.
+        if self.command == "codex":
             flags = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
-
-            # Use positional arguments for small prompts (more reliable, avoids stdin noise).
-            # Fall back to stdin only for very large prompts.
-            if len(prompt) < _ARG_MAX:
-                command_args = _build_argv(self.command, flags + [prompt], cwd=cwd)
-                stdin_data = None
-            else:
-                command_args = _build_argv(self.command, flags, cwd=cwd)
-                stdin_data = prompt
-
-            yield from self._execute_jsonl_stream(command_args, stdin_data, cwd)
+            use_stdin = len(prompt) > _ARG_MAX
+            if not use_stdin:
+                flags.append(prompt)
+            command_args = _build_argv(self.command, flags, cwd=cwd)
+            yield from self._execute_jsonl_stream(command_args, prompt if use_stdin else None, cwd)
             return
-        elif self.command == "grok":
-            if use_stdin:
-                command_args = _build_argv(self.command, ["--print"], cwd=cwd)
-                stdin_data = prompt
-            else:
-                command_args = _build_argv(self.command, ["--print", prompt], cwd=cwd)
-        else:
-            # any future --print-compatible CLI
-            if use_stdin:
-                command_args = _build_argv(self.command, ["--print"], cwd=cwd)
-                stdin_data = prompt
-            else:
-                command_args = _build_argv(self.command, ["--print", prompt], cwd=cwd)
+
+        command_args, stdin_data, use_stdin = self._build_popen_args(prompt, cwd, mode)
+        if not command_args:
+             raise ValueError(f"Unsupported agent command: {self.command}")
 
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
@@ -194,10 +200,8 @@ class CLIAgent:
                 process.stdin.write(stdin_data)
                 process.stdin.close()
 
-            full_output = []
             for raw_line in process.stdout:
                 line = _ANSI_RE.sub("", raw_line)
-                full_output.append(line)
                 stripped = line.strip()
                 if stripped and not any(
                     stripped.startswith(p) for p in _SUPPRESS_PREFIXES
@@ -286,24 +290,44 @@ class CLIAgent:
                 process.terminate()
 
     def _execute_claude_stream(
-        self, prompt: str, cwd: str, session_id: str, use_stdin: bool
+        self, prompt: str, cwd: str, session_id: str, use_stdin: bool, mode: str = "plan"
     ) -> Generator[str, None, None]:
         """Run claude with stream-json output and MCP permission tool."""
+        backend_url = "http://leadagent-backend:8000" if os.environ.get("LEADAGENT_DOCKER_MODE") else "http://localhost:8000"
+        
+        # Use python3 as the command in containers, sys.executable locally
+        python_cmd = "python3" if os.environ.get("LEADAGENT_DOCKER_MODE") else sys.executable
+
         mcp_cfg = {
             "mcpServers": {
                 "leadagent_perm": {
-                    "command": sys.executable,
+                    "command": python_cmd,
                     "args": ["-m", "backend.permission_mcp_server"],
                     "env": {
                         "LEADAGENT_SESSION_ID": session_id,
-                        "LEADAGENT_BACKEND_URL": "http://localhost:8000",
+                        "LEADAGENT_BACKEND_URL": backend_url,
                         "LEADAGENT_AGENT_NAME": "claude",
-                        "PYTHONPATH": _PROJECT_ROOT,
+                        "PYTHONPATH": "/app/leadagent-data" if os.environ.get("LEADAGENT_DOCKER_MODE") else _PROJECT_ROOT,
                     },
+                },
+                "leadagent_main": {
+                    "command": python_cmd,
+                    "args": ["-m", "backend.main_mcp_server"],
+                    "env": {
+                        "LEADAGENT_SESSION_ID": session_id,
+                        "LEADAGENT_BACKEND_URL": backend_url,
+                        "PYTHONPATH": "/app/leadagent-data" if os.environ.get("LEADAGENT_DOCKER_MODE") else _PROJECT_ROOT,
+                    },
+                },
+                "docker": {
+                    "command": "npx",
+                    "args": ["-y", "@docker/mcp-server"],
                 }
             }
         }
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+        # In Docker mode, write to the shared volume so the agent container can read it
+        temp_dir = _PROJECT_ROOT if os.environ.get("LEADAGENT_DOCKER_MODE") else None
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, dir=temp_dir) as fh:
             json.dump(mcp_cfg, fh)
             mcp_path = fh.name
 
@@ -313,9 +337,13 @@ class CLIAgent:
             "--verbose",
             "--mcp-config",
             mcp_path,
-            "--permission-prompt-tool",
-            "mcp__leadagent_perm__ask_permission",
         ]
+        
+        if mode != "execute":
+            stream_flags += [
+                "--permission-prompt-tool",
+                "mcp__leadagent_perm__ask_permission",
+            ]
 
         if use_stdin:
             command_args = _build_argv("claude", stream_flags)
@@ -409,9 +437,53 @@ class CLIAgent:
             )
 
 
+import requests
+
+class OllamaAgent:
+    """Agent that talks to a local Ollama server."""
+    def __init__(self, model: str = "llama3"):
+        self.model = model
+        default_host = "http://ollama:11434" if os.environ.get("LEADAGENT_DOCKER_MODE") else "http://localhost:11434"
+        self.url = os.environ.get("OLLAMA_HOST", default_host)
+
+    def execute_stream(
+        self,
+        prompt: str,
+        cwd: str = ".",
+        session_id: str = "default",
+        simple: bool = False,
+    ) -> Generator[str, None, None]:
+        try:
+            response = requests.post(
+                f"{self.url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": True,
+                },
+                stream=True,
+                timeout=5,
+            )
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    yield data.get("response", "")
+                    if data.get("done"):
+                        break
+        except requests.exceptions.HTTPError as he:
+            if he.response.status_code == 404:
+                yield f"\n[Ollama Error]: Model '{self.model}' not found. Run 'ollama pull {self.model}' to install it.\n"
+            else:
+                yield f"\n[Ollama Error]: HTTP {he.response.status_code} - {he.response.text}\n"
+        except Exception as e:
+            yield f"\n[Ollama Error]: {e}\n"
+
 class AgentFactory:
     @staticmethod
-    def get_agent(agent_name: str) -> CLIAgent:
+    def get_agent(agent_name: str) -> Any:
+        if agent_name == "ollama":
+            return OllamaAgent()
         if agent_name in _CLI_MAP:
             return CLIAgent(_CLI_MAP[agent_name])
         raise ValueError(f"Unknown agent: {agent_name}")

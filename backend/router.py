@@ -1,4 +1,5 @@
 import re
+import json
 from typing import Optional
 
 from backend.db import db
@@ -28,20 +29,19 @@ def _cli_available(agent: str) -> bool:
 # ── Rule-based task classifier (no API call, no quota spend) ─────────────────
 
 _TASK_PATTERNS = {
-    "coding": r"\b(code|function|class|method|def |bug|fix|refactor|implement|debug|test|compile|syntax|variable|loop|algorithm|api|sql|json|yaml|exception|import|module|library|framework|deploy|dockerfile|script)\b",
-    "deep_analysis": r"\b(analyze|analyse|review|audit|security|performance|architecture|evaluate|assess|critique|deep.dive|trade.?off|bottleneck)\b",
-    "research": r"\b(what is|explain|how does|why|when did|history|compare|difference|overview|describe|tell me about|who is|where is|background)\b",
-    "long_context": r"\b(summarize|summarise|entire|full file|whole file|all of|document|codebase|transcript|paste)\b",
-    "creative": r"\b(write a|create a|generate|draft|compose|story|poem|blog|essay|marketing|copy)\b",
-    "logic": r"\b(solve|calculate|math|proof|prove|equation|formula|logic|reasoning|puzzle|optimise|optimize)\b",
+    "coding": re.compile(r"\b(code|function|class|method|def |bug|fix|refactor|implement|debug|test|compile|syntax|variable|loop|algorithm|api|sql|json|yaml|exception|import|module|library|framework|deploy|dockerfile|script)\b", re.IGNORECASE),
+    "deep_analysis": re.compile(r"\b(analyze|analyse|review|audit|security|performance|architecture|evaluate|assess|critique|deep.dive|trade.?off|bottleneck)\b", re.IGNORECASE),
+    "research": re.compile(r"\b(what is|explain|how does|why|when did|history|compare|difference|overview|describe|tell me about|who is|where is|background)\b", re.IGNORECASE),
+    "long_context": re.compile(r"\b(summarize|summarise|entire|full file|whole file|all of|document|codebase|transcript|paste)\b", re.IGNORECASE),
+    "creative": re.compile(r"\b(write a|create a|generate|draft|compose|story|poem|blog|essay|marketing|copy)\b", re.IGNORECASE),
+    "logic": re.compile(r"\b(solve|calculate|math|proof|prove|equation|formula|logic|reasoning|puzzle|optimise|optimize)\b", re.IGNORECASE),
 }
 
 
 def _classify_task(prompt: str) -> tuple[str, str]:
-    lower = prompt.lower()
     best, best_n = "general", 0
     for task, pattern in _TASK_PATTERNS.items():
-        n = len(re.findall(pattern, lower))
+        n = len(pattern.findall(prompt))
         if n > best_n:
             best, best_n = task, n
 
@@ -52,6 +52,41 @@ def _classify_task(prompt: str) -> tuple[str, str]:
         complexity = "medium"
 
     return best, complexity
+
+
+def _classify_task_slm(prompt: str) -> Optional[dict]:
+    """Use local Ollama to classify task and recommend agents. Zero cloud quota cost."""
+    from backend.agents import agent_factory
+    try:
+        ollama = agent_factory.get_agent("ollama")
+        routing_prompt = f"""
+Analyze the following user prompt and categorize it for multi-agent routing.
+Respond ONLY with a JSON object in this format:
+{{
+  "task_type": "coding" | "research" | "deep_analysis" | "long_context" | "creative" | "logic" | "general",
+  "complexity": "low" | "medium" | "high",
+  "mode": "plan" | "execute",
+  "recommended_agents": ["claude", "gemini", "codex", "grok"],
+  "explanation": "short reason",
+  "parallel": true | false
+}}
+
+Prompt: {prompt}
+"""
+        response = ""
+        for chunk in ollama.execute_stream(routing_prompt, simple=True):
+            if "[Ollama Error]: Model" in chunk:
+                print(f"[_classify_task_slm] Skipping SLM routing: {chunk.strip()}")
+                return None
+            response += chunk
+
+        # Extract JSON from potential markdown blocks
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+    except Exception as e:
+        print(f"[_classify_task_slm] Error: {e}")
+    return None
 
 
 from backend.models import ErrorType
@@ -98,6 +133,28 @@ class AgentRouter:
             print(f"[_get_best_affinity_agent] {e}")
         return None
 
+    def _reason_task_slm(self, prompt: str) -> Optional[str]:
+        """Use local Ollama to generate a structured reasoning/planning block for complex tasks."""
+        from backend.agents import agent_factory
+        try:
+            ollama = agent_factory.get_agent("ollama")
+            reasoning_prompt = f"""
+You are the LeadAgent reasoning engine. Analyze the user's prompt and create a detailed step-by-step implementation plan.
+Focus on identifying potential pitfalls, required tools, and architectural impact.
+
+User Prompt: {prompt}
+
+Output your plan as a structured "INTERNAL REASONING" block.
+"""
+            response = ""
+            for chunk in ollama.execute_stream(reasoning_prompt, simple=True):
+                if "[Ollama Error]" in chunk:
+                    return None
+                response += chunk
+            return response.strip()
+        except:
+            return None
+
     def update_outcome(self, task_type: str, agent: str, success: bool):
         """Update affinity based on whether the agent's work was successful."""
         delta = 0.1 if success else -0.2
@@ -113,7 +170,7 @@ class AgentRouter:
 
         # ── Graph: matched entities ───────────────────────────────────────────
         all_entity_rows = db.query_all(
-            "MATCH (e:Entity) WHERE $prompt CONTAINS e.name RETURN e.name, e.type, e.description",
+            "MATCH (e:Entity) WHERE lower($prompt) CONTAINS lower(e.name) RETURN e.name, e.type, e.description",
             {"prompt": prompt},
         )
         new_entity_rows = context_cache.filter_entities(session_id, all_entity_rows)
@@ -122,26 +179,26 @@ class AgentRouter:
         ]  # all — for relationship + QA lookup
         {row[0] for row in new_entity_rows}
 
-        # ── Graph: 1-hop relationships (only from new entities) ───────────────
+        # ── Graph: 1-hop relationships (batched) ───────────────
         all_rel_rows = []
-        for name in entity_names:
-            for row in db.query_all(
-                "MATCH (a:Entity {name: $name})-[r:RELATED_TO]->(b:Entity) "
+        if entity_names:
+            all_rel_rows = db.query_all(
+                "MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) "
+                "WHERE a.name IN $names "
                 "RETURN a.name, b.name, b.type, b.description, r.type",
-                {"name": name},
-            ):
-                all_rel_rows.append(row)
+                {"names": entity_names},
+            )
         new_rel_rows = context_cache.filter_relations(session_id, all_rel_rows)
 
-        # ── Graph: past Q&A (only for new entities) ───────────────────────────
+        # ── Graph: past Q&A (batched) ───────────────────────────
         all_qa_rows = []
-        for name in entity_names:
-            for row in db.query_all(
-                "MATCH (q:Question)-[:ABOUT]->(e:Entity {name: $name}) "
-                "RETURN q.prompt, q.answer, q.agent ORDER BY q.timestamp DESC LIMIT 2",
-                {"name": name},
-            ):
-                all_qa_rows.append(row)
+        if entity_names:
+            all_qa_rows = db.query_all(
+                "MATCH (q:Question)-[:ABOUT]->(e:Entity) "
+                "WHERE e.name IN $names "
+                "RETURN q.prompt, q.answer, q.agent ORDER BY q.timestamp DESC LIMIT 10",
+                {"names": entity_names},
+            )
         new_qa_rows = context_cache.filter_qa(session_id, all_qa_rows)
 
         # ── Graph: Filesystem structure (keyword match on path/name) ─────────
@@ -224,7 +281,7 @@ class AgentRouter:
                     text,
                 )
             )
-            entities = [t for t in technical if 3 < len(t) < 60][:12]
+            entities = [t for t in technical if 3 < len(t) < 60][:50]
 
             # Store the question first to get a stable ID
             qid = db.add_question(prompt, answer[:500], agent)
@@ -294,10 +351,10 @@ class AgentRouter:
 
     def route_multi(
         self, task_type: str, prompt: str = "", preferred_agent: str = None
-    ) -> list[str]:
+    ) -> tuple[list[str], dict]:
         """
-        Like route() but returns a list. Multiple agents = fan-out request.
-        Single agent = [agent]. No match = [auto-routed agent].
+        Like route() but returns (list[agents], metadata).
+        Multiple agents = fan-out request.
         """
         available = [
             a
@@ -305,16 +362,32 @@ class AgentRouter:
             if _cli_available(a) and is_authenticated(a) is not False
         ]
         if not available:
-            return ["none"]
+            return ["none"], {}
 
         if preferred_agent and preferred_agent in available:
-            return [preferred_agent]
+            return [preferred_agent], {}
 
         if prompt:
             inferred = self._infer_agents_from_prompt(prompt)
             valid = [a for a in inferred if a in available]
             if valid:
-                return valid
+                return valid, {}
+
+        # ── Tier 0: SLM-based routing (Ollama) ──
+        slm_decision = _classify_task_slm(prompt) if prompt else None
+        if slm_decision:
+            task_type = slm_decision.get("task_type", task_type)
+            complexity = slm_decision.get("complexity", "low")
+            recommended = [
+                a for a in slm_decision.get("recommended_agents", []) if a in available
+            ]
+            if recommended:
+                # For high complexity, generate internal reasoning block
+                if complexity == "high":
+                    reasoning = self._reason_task_slm(prompt)
+                    if reasoning:
+                        slm_decision["internal_reasoning"] = reasoning
+                return recommended, slm_decision
 
         if task_type == "general" and prompt:
             task_type, complexity = _classify_task(prompt)
@@ -329,15 +402,15 @@ class AgentRouter:
                 # For high complexity, add a second agent to critique
                 critics = [a for a in available if a != best_affinity]
                 if critics:
-                    return [best_affinity, critics[0]]  # [Primary, Critic]
-            return [best_affinity]
+                    return [best_affinity, critics[0]], {"complexity": complexity}
+            return [best_affinity], {"complexity": complexity}
 
         # ── Tier 2: Strength-based routing (Static fallback) ─────────────────
         for agent in available:
             if task_type in self.strengths.get(agent, []):
-                return [agent]
+                return [agent], {"complexity": complexity}
 
-        return [available[0]]
+        return [available[0]], {"complexity": complexity}
 
     def get_explanation(self, agent: str, prompt: str) -> str:
         task_type, complexity = _classify_task(prompt)
@@ -355,7 +428,8 @@ class AgentRouter:
         self, task_type: str, prompt: str = "", preferred_agent: str = None
     ) -> str:
         """Single-agent routing — returns first result from route_multi."""
-        return self.route_multi(task_type, prompt, preferred_agent)[0]
+        agents, _ = self.route_multi(task_type, prompt, preferred_agent)
+        return agents[0]
 
 
 agent_router = AgentRouter()
