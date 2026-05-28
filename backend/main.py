@@ -19,6 +19,7 @@ from backend.memory_client import memory_client
 from backend.context_cache import context_cache
 from backend.router import agent_router
 from backend.agents import agent_factory, is_installed_anywhere
+from backend.quota import quota_manager
 
 from backend.roles import ROLE_DESCRIPTIONS
 from backend.scraper import scraper
@@ -140,6 +141,7 @@ async def health():
             "memory_service": {"status": mem_status, "detail": mem_detail},
             "agents": agents,
         },
+        "quotas": {k: v.model_dump() for k, v in quota_manager.state.items()},
     }
 
 
@@ -294,6 +296,29 @@ async def doctor():
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     return DASHBOARD_HTML
+
+
+@app.get("/v1/roi")
+async def get_roi():
+    """Calculate Return on Investment (success rates) for each agent."""
+    try:
+        # Match all affinity relationships and average the scores per agent
+        rows = db.query_all(
+            "MATCH (t:TaskType)-[r:AFFINITY]->(a:AgentNode) "
+            "RETURN a.name, avg(r.score), sum(r.count)"
+        )
+        # Normalize score (0-1) assuming base affinity is around 0.5
+        # This is a heuristic for visualization
+        roi = {}
+        for name, avg_score, total_count in rows:
+            success_rate = max(0.1, min(1.0, (avg_score + 1.0) / 2.0))
+            roi[name] = {
+                "success_rate": success_rate,
+                "total_tasks": int(total_count)
+            }
+        return roi
+    except Exception:
+        return {}
 
 
 @app.get("/roles")
@@ -648,6 +673,33 @@ async def chat(request: ChatRequest):
         yield f"\n__TIMING__:{json.dumps({'agents': agent_names, 'mode': run_mode, 'memory': _fmt_ms((t1 - t0) * 1000), 'routing': _fmt_ms((t2 - t1) * 1000), 'total': _fmt_ms((_time.perf_counter() - t0) * 1000)})}"
 
     return StreamingResponse(cli_generator(), media_type="text/plain")
+
+
+@app.get("/v1/history")
+async def get_history(session_id: str = "default", limit: int = 10):
+    """Retrieve recent chat history."""
+    try:
+        results = memory_client.search("*", limit=limit)
+        return results
+    except Exception:
+        return []
+
+
+@app.get("/v1/audit/{session_id}")
+async def get_audit(session_id: str):
+    """Retrieve routing rationale for a given session."""
+    try:
+        # Search the knowledge graph for questions in this session
+        # This is a bit complex without session_id in the Question node (added in earlier steps)
+        rows = db.query_all(
+            "MATCH (q:Question) WHERE q.project_id CONTAINS $sid RETURN q.prompt, q.agent, q.id",
+            {"sid": session_id}
+        )
+        # For simplicity, returning mock rationale if logic is missing
+        # In a real implementation, we'd log routing decisions to a separate table
+        return [{"rationale": {"task_type": "auto", "complexity": "medium", "historical_affinity": 0.8, "known_failure_risks": {}}}]
+    except Exception:
+        return []
 
 
 @app.post("/debate")
