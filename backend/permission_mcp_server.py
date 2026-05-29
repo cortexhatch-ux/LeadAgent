@@ -15,6 +15,10 @@ BACKEND_URL = os.environ.get("LEADAGENT_BACKEND_URL", "http://localhost:8000")
 SESSION_ID = os.environ.get("LEADAGENT_SESSION_ID", "default")
 AGENT_NAME = os.environ.get("LEADAGENT_AGENT_NAME", "claude")
 
+# Rules are evaluated via the backend HTTP API so this server stays stateless.
+# The backend holds the DB connection and the rules engine.
+_RULES_URL = f"{BACKEND_URL}/rules/evaluate"
+
 _TOOLS = [
     {
         "name": "ask_permission",
@@ -97,6 +101,39 @@ def _handle(msg: dict) -> None:
 def _ask_permission(id_: object, args: dict) -> None:
     tool_name = args.get("tool_name", "")
     input_ = args.get("input", {})
+
+    # ── Rules layer: evaluate before asking the user ──────────────────────────
+    try:
+        rule_resp = requests.post(
+            _RULES_URL,
+            json={"tool_name": tool_name, "input": input_, "agent": AGENT_NAME, "session_id": SESSION_ID},
+            timeout=5,
+        )
+        if rule_resp.ok:
+            rule = rule_resp.json()
+            action = rule.get("action", "ask")
+            reason = rule.get("reason", "")
+            if action == "allow":
+                _send({
+                    "jsonrpc": "2.0", "id": id_,
+                    "result": {"content": [{"type": "text", "text": json.dumps({
+                        "behavior": "allow", "updatedInput": input_,
+                    })}], "isError": False},
+                })
+                return
+            if action == "deny":
+                _send({
+                    "jsonrpc": "2.0", "id": id_,
+                    "result": {"content": [{"type": "text", "text": json.dumps({
+                        "behavior": "deny",
+                        "message": reason or f"Blocked by MCP rule (tool: {tool_name}).",
+                    })}], "isError": False},
+                })
+                return
+            # action == "ask" — fall through to user prompt
+    except Exception:
+        pass  # rules service unavailable — fall through to user prompt
+    # ─────────────────────────────────────────────────────────────────────────
 
     try:
         resp = requests.post(

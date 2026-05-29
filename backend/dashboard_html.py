@@ -95,6 +95,77 @@ DASHBOARD_HTML = """
                 </div>
             </div>
         </div>
+
+        <!-- MCP Rules -->
+        <div class="card p-5 mt-6">
+            <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center gap-2 text-slate-400">
+                    <i data-lucide="shield" class="w-4 h-4"></i>
+                    <h2 class="text-sm font-semibold uppercase tracking-wider">MCP Tool Rules</h2>
+                </div>
+                <button onclick="refreshRules()" class="text-slate-500 hover:text-white transition">
+                    <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                </button>
+            </div>
+            <p class="text-xs text-slate-500 mb-4">Structural enforcement — rules are evaluated before any tool reaches the agent. Higher priority wins.</p>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-xs uppercase text-slate-500 border-b border-slate-700">
+                            <th class="pb-2 pr-4">Tool</th>
+                            <th class="pb-2 pr-4">Scope</th>
+                            <th class="pb-2 pr-4">Reason</th>
+                            <th class="pb-2 pr-4">Priority</th>
+                            <th class="pb-2 pr-4">Action</th>
+                            <th class="pb-2"></th>
+                        </tr>
+                    </thead>
+                    <tbody id="rules-table" class="divide-y divide-slate-800">
+                        <!-- Rules injected here -->
+                    </tbody>
+                </table>
+            </div>
+            <!-- Add rule form -->
+            <div class="mt-4 pt-4 border-t border-slate-700">
+                <div class="flex flex-wrap gap-2 items-end">
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">Tool pattern</label>
+                        <input id="new-tool" type="text" placeholder="e.g. Bash, write_file, *" class="bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-sm text-white w-40 focus:outline-none focus:border-indigo-500">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">Action</label>
+                        <select id="new-action" class="bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-indigo-500">
+                            <option value="ask">ask</option>
+                            <option value="allow">allow</option>
+                            <option value="deny">deny</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">Scope</label>
+                        <div class="flex gap-1">
+                            <select id="new-scope-type" onchange="onScopeTypeChange()" class="bg-slate-800 border border-slate-600 rounded px-2 py-1.5 text-sm text-white focus:outline-none focus:border-indigo-500">
+                                <option value="global">global</option>
+                                <option value="agent">agent:</option>
+                                <option value="session">session:</option>
+                            </select>
+                            <input id="new-scope-value" type="text" placeholder="name or id" class="bg-slate-800 border border-slate-600 rounded px-2 py-1.5 text-sm text-white w-28 focus:outline-none focus:border-indigo-500 hidden">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">Priority</label>
+                        <input id="new-priority" type="number" placeholder="0" value="10" class="bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-sm text-white w-20 focus:outline-none focus:border-indigo-500">
+                    </div>
+                    <div class="flex-1">
+                        <label class="block text-xs text-slate-500 mb-1">Reason (optional)</label>
+                        <input id="new-reason" type="text" placeholder="Why this rule exists" class="bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-sm text-white w-full focus:outline-none focus:border-indigo-500">
+                    </div>
+                    <button onclick="addRule()" class="bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold px-4 py-1.5 rounded transition">
+                        + Add Rule
+                    </button>
+                </div>
+                <div id="rules-feedback" class="mt-2 text-xs hidden"></div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -244,17 +315,23 @@ DASHBOARD_HTML = """
                     const entry = document.createElement('div');
                     entry.className = 'p-3 bg-slate-800/30 rounded-lg border border-slate-700/30 text-sm';
                     
-                    const lines = item.content.split('\\n');
-                    const userLine = lines[0].replace('User: ', '');
+                    // Strip Go CLI conversation history — take last "User:" segment
+                    let userLine = item.content;
+                    const lastUser = userLine.lastIndexOf('\\nUser:');
+                    if (lastUser !== -1) userLine = userLine.slice(lastUser + 6).trim();
+                    else userLine = userLine.replace(/^User:\s*/, '').split('\\n')[0];
+                    userLine = userLine.replace(/=== YOUR TASK ===/g, '').replace(/=== END TASK ===/g, '').trim();
                     const agent = item.metadata.agent || 'unknown';
                     const sid = item.metadata.session_id || 'default';
                     
+                    const preview = item.metadata.answer_preview || '';
                     entry.innerHTML = `
                         <div class="flex justify-between mb-1">
                             <span class="text-indigo-400 font-semibold text-xs uppercase">${agent}</span>
                             <button onclick="toggleAudit('${sid}', this)" class="text-[10px] text-slate-500 hover:text-indigo-400 transition">Audit Trace</button>
                         </div>
-                        <div class="text-slate-300 truncate mb-2">${userLine}</div>
+                        <div class="text-slate-300 truncate mb-1">${userLine}</div>
+                        ${preview ? `<div class="text-slate-500 text-xs truncate">${preview}</div>` : ''}
                         <div class="audit-details hidden space-y-2 border-t border-slate-700 pt-2 mt-2 text-[10px] text-slate-400">
                             <div class="italic">Loading causal narrative...</div>
                         </div>
@@ -312,14 +389,161 @@ DASHBOARD_HTML = """
             return colors[key] || '#64748b';
         }
 
+        // ── MCP Rules ────────────────────────────────────────────────────────
+
+        const ACTION_STYLES = {
+            allow: 'bg-green-900 text-green-300',
+            deny:  'bg-red-900 text-red-300',
+            ask:   'bg-yellow-900 text-yellow-300',
+        };
+
+        async function refreshRules() {
+            const tbody = document.getElementById('rules-table');
+            tbody.innerHTML = '<tr><td colspan="6" class="py-3 text-slate-500 text-xs italic">Loading...</td></tr>';
+            try {
+                const resp = await fetch('/rules');
+                const rules = await resp.json();
+                tbody.innerHTML = '';
+                if (rules.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="py-3 text-slate-500 text-xs italic">No rules defined. Add one below.</td></tr>';
+                    return;
+                }
+                rules.forEach(r => {
+                    const tr = document.createElement('tr');
+                    tr.className = 'text-slate-300 text-sm';
+                    const style = ACTION_STYLES[r.action] || 'bg-slate-700 text-slate-300';
+                    tr.innerHTML = `
+                        <td class="py-2 pr-4 mono font-medium text-white">${r.tool_pattern}</td>
+                        <td class="py-2 pr-4 text-xs text-slate-400">${r.scope}</td>
+                        <td class="py-2 pr-4 text-xs text-slate-400 max-w-[180px] truncate" title="${r.reason || ''}">${r.reason || '—'}</td>
+                        <td class="py-2 pr-4 text-xs text-slate-400">${r.priority}</td>
+                        <td class="py-2 pr-4">
+                            <select onchange="updateRuleAction('${r.id}', this.value, this)" class="bg-slate-800 border border-slate-700 rounded px-2 py-0.5 text-xs font-semibold ${style} focus:outline-none cursor-pointer">
+                                <option value="allow" ${r.action==='allow'?'selected':''}>allow</option>
+                                <option value="ask"   ${r.action==='ask'  ?'selected':''}>ask</option>
+                                <option value="deny"  ${r.action==='deny' ?'selected':''}>deny</option>
+                            </select>
+                        </td>
+                        <td class="py-2">
+                            <button onclick="deleteRule('${r.id}', this)" class="text-slate-600 hover:text-red-400 transition" title="Delete rule">
+                                <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                            </button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+                lucide.createIcons();
+            } catch (err) {
+                tbody.innerHTML = '<tr><td colspan="6" class="py-3 text-red-400 text-xs">Failed to load rules.</td></tr>';
+            }
+        }
+
+        async function updateRuleAction(ruleId, newAction, selectEl) {
+            // Delete the old rule and recreate with the new action, preserving other fields
+            try {
+                const resp = await fetch('/rules');
+                const rules = await resp.json();
+                const rule = rules.find(r => r.id === ruleId);
+                if (!rule) return;
+
+                await fetch(`/rules/${ruleId}`, { method: 'DELETE' });
+                await fetch('/rules', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        tool_pattern: rule.tool_pattern,
+                        action: newAction,
+                        scope: rule.scope,
+                        reason: rule.reason || '',
+                        input_match: rule.input_match || '',
+                        priority: rule.priority,
+                    }),
+                });
+                // Update select style
+                selectEl.className = selectEl.className.replace(/bg-\S+ text-\S+/, '');
+                const style = ACTION_STYLES[newAction] || 'bg-slate-700 text-slate-300';
+                selectEl.classList.add(...style.split(' '));
+                showFeedback(`Rule updated: ${rule.tool_pattern} → ${newAction}`, 'green');
+                refreshRules();
+            } catch (err) {
+                showFeedback('Failed to update rule.', 'red');
+            }
+        }
+
+        async function deleteRule(ruleId, btn) {
+            try {
+                await fetch(`/rules/${ruleId}`, { method: 'DELETE' });
+                btn.closest('tr').remove();
+                showFeedback('Rule deleted.', 'slate');
+            } catch (err) {
+                showFeedback('Failed to delete rule.', 'red');
+            }
+        }
+
+        function onScopeTypeChange() {
+            const type = document.getElementById('new-scope-type').value;
+            const valInput = document.getElementById('new-scope-value');
+            if (type === 'global') {
+                valInput.classList.add('hidden');
+                valInput.value = '';
+            } else {
+                valInput.classList.remove('hidden');
+                valInput.placeholder = type === 'agent' ? 'claude / gemini / grok' : 'session id';
+            }
+        }
+
+        async function addRule() {
+            const tool = document.getElementById('new-tool').value.trim();
+            const action = document.getElementById('new-action').value;
+            const scopeType = document.getElementById('new-scope-type').value;
+            const scopeVal = document.getElementById('new-scope-value').value.trim();
+            const scope = scopeType === 'global' ? 'global' : `${scopeType}:${scopeVal}`;
+            const priority = parseInt(document.getElementById('new-priority').value) || 0;
+            const reason = document.getElementById('new-reason').value.trim();
+
+            if (scopeType !== 'global' && !scopeVal) {
+                showFeedback('Enter a value for the scope (agent name or session id).', 'red');
+                return;
+            }
+
+            if (!tool) { showFeedback('Tool pattern is required.', 'red'); return; }
+
+            try {
+                const resp = await fetch('/rules', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tool_pattern: tool, action, scope, priority, reason }),
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+                document.getElementById('new-tool').value = '';
+                document.getElementById('new-reason').value = '';
+                document.getElementById('new-priority').value = '10';
+                showFeedback(`Rule added: ${tool} → ${action}`, 'green');
+                refreshRules();
+            } catch (err) {
+                showFeedback('Failed to add rule: ' + err.message, 'red');
+            }
+        }
+
+        function showFeedback(msg, color) {
+            const el = document.getElementById('rules-feedback');
+            const colors = { green: 'text-green-400', red: 'text-red-400', slate: 'text-slate-400' };
+            el.className = `mt-2 text-xs ${colors[color] || 'text-slate-400'}`;
+            el.textContent = msg;
+            el.classList.remove('hidden');
+            setTimeout(() => el.classList.add('hidden'), 3000);
+        }
+
         // Init
         lucide.createIcons();
         fetchData();
         refreshHistory();
         refreshGraph();
+        refreshRules();
         setInterval(fetchData, 5000);
         setInterval(refreshHistory, 30000);
         setInterval(refreshGraph, 60000);
+        setInterval(refreshRules, 15000);
     </script>
 </body>
 </html>

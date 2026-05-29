@@ -28,6 +28,19 @@ def _cli_available(agent: str) -> bool:
 
 # ── Rule-based task classifier (no API call, no quota spend) ─────────────────
 
+_EXECUTE_PATTERN = re.compile(
+    r"\b(edit|update|modify|change|fix|rewrite|replace|add to|insert|delete from|remove from|refactor|rename)\b.{0,80}"
+    r"\.(md|py|go|ts|js|json|yaml|yml|txt|sh|toml|cfg|env|html|css)\b"
+    r"|\b(update|edit|modify|change|fix|rewrite)\b.{0,40}\b(readme|config|file|script|template|dockerfile)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _detect_execute_mode(prompt: str) -> str:
+    """Return 'execute' if the prompt is clearly a file-edit task, else 'plan'."""
+    return "execute" if _EXECUTE_PATTERN.search(prompt) else "plan"
+
+
 _TASK_PATTERNS = {
     "coding": re.compile(r"\b(code|function|class|method|def |bug|fix|refactor|implement|debug|test|compile|syntax|variable|loop|algorithm|api|sql|json|yaml|exception|import|module|library|framework|deploy|dockerfile|script)\b", re.IGNORECASE),
     "deep_analysis": re.compile(r"\b(analyze|analyse|review|audit|security|performance|architecture|evaluate|assess|critique|deep.dive|trade.?off|bottleneck)\b", re.IGNORECASE),
@@ -266,11 +279,28 @@ Output your plan as a structured "INTERNAL REASONING" block.
 
         return "\n\n".join(combined)
 
+    @staticmethod
+    def _extract_user_prompt(prompt: str) -> str:
+        """Strip Go CLI conversation history prefix, return only the last user message."""
+        # CLI prepends "[Conversation so far]\nUser: ...\nAssistant: ...\nUser: <actual>"
+        # Find the last "User:" line and return everything after it.
+        last = prompt.rfind("\nUser:")
+        if last != -1:
+            return prompt[last + 6:].strip()  # 6 = len("\nUser:")
+        # Also strip our injected task delimiters if present
+        task_start = prompt.find("=== YOUR TASK ===")
+        if task_start != -1:
+            end = prompt.find("=== END TASK ===", task_start)
+            inner = prompt[task_start + 17: end if end != -1 else None].strip()
+            return inner
+        return prompt.strip()
+
     def learn_from_prompt(self, prompt: str, answer: str, agent: str):
         """
         Extract entities from a completed Q&A via regex heuristics.
         No LLM call — zero quota spend for bookkeeping.
         """
+        prompt = self._extract_user_prompt(prompt)
         try:
             text = f"{prompt} {answer}"
             technical = set(
@@ -371,7 +401,7 @@ Output your plan as a structured "INTERNAL REASONING" block.
             inferred = self._infer_agents_from_prompt(prompt)
             valid = [a for a in inferred if a in available]
             if valid:
-                return valid, {}
+                return valid, {"mode": _detect_execute_mode(prompt)}
 
         # ── Tier 0: SLM-based routing (Ollama) ──
         slm_decision = _classify_task_slm(prompt) if prompt else None
@@ -387,6 +417,8 @@ Output your plan as a structured "INTERNAL REASONING" block.
                     reasoning = self._reason_task_slm(prompt)
                     if reasoning:
                         slm_decision["internal_reasoning"] = reasoning
+                # Deterministic override: never trust Ollama's mode for file-edit tasks
+                slm_decision["mode"] = _detect_execute_mode(prompt)
                 return recommended, slm_decision
 
         if task_type == "general" and prompt:
@@ -402,15 +434,15 @@ Output your plan as a structured "INTERNAL REASONING" block.
                 # For high complexity, add a second agent to critique
                 critics = [a for a in available if a != best_affinity]
                 if critics:
-                    return [best_affinity, critics[0]], {"complexity": complexity}
-            return [best_affinity], {"complexity": complexity}
+                    return [best_affinity, critics[0]], {"complexity": complexity, "mode": _detect_execute_mode(prompt)}
+            return [best_affinity], {"complexity": complexity, "mode": _detect_execute_mode(prompt)}
 
         # ── Tier 2: Strength-based routing (Static fallback) ─────────────────
         for agent in available:
             if task_type in self.strengths.get(agent, []):
-                return [agent], {"complexity": complexity}
+                return [agent], {"complexity": complexity, "mode": _detect_execute_mode(prompt)}
 
-        return [available[0]], {"complexity": complexity}
+        return [available[0]], {"complexity": complexity, "mode": _detect_execute_mode(prompt)}
 
     def get_explanation(self, agent: str, prompt: str) -> str:
         task_type, complexity = _classify_task(prompt)

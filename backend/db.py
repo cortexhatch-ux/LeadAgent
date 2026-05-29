@@ -69,6 +69,24 @@ class GraphDB:
             "CREATE REL TABLE FAILED_BECAUSE(FROM AgentNode TO ErrorType, count INT64)"
         )
 
+        # MCP Rules layer — evaluated before user permission prompts
+        # action: "allow" | "deny" | "ask"
+        # scope:  "global" | "agent:<name>" | "session:<id>"
+        # tool_pattern: exact tool name or glob prefix (e.g. "bash*", "write_file")
+        # input_match: JSON string of key:value pairs that must all match input (optional)
+        self._try_create(
+            "CREATE NODE TABLE MCPRule("
+            "id STRING, "
+            "tool_pattern STRING, "
+            "action STRING, "
+            "scope STRING, "
+            "reason STRING, "
+            "input_match STRING, "
+            "priority INT64, "
+            "created_at DOUBLE, "
+            "PRIMARY KEY (id))"
+        )
+
     # ── write methods (all lock-protected) ──────────────────────────────────
 
     def add_file(self, path: str, name: str, extension: str, project_id: str):
@@ -322,6 +340,52 @@ class GraphDB:
                 )
             except Exception as e:
                 print(f"[log_agent_failure] Error: {e}")
+
+    # ── MCP Rules CRUD ───────────────────────────────────────────────────────
+
+    def add_rule(
+        self,
+        tool_pattern: str,
+        action: str,
+        scope: str = "global",
+        reason: str = "",
+        input_match: str = "",
+        priority: int = 0,
+    ) -> str:
+        rule_id = uuid.uuid4().hex
+        with self._lock:
+            self.connection.execute(
+                "CREATE (r:MCPRule {id: $id, tool_pattern: $tp, action: $act, "
+                "scope: $sc, reason: $rs, input_match: $im, priority: $pr, created_at: $ts})",
+                {
+                    "id": rule_id,
+                    "tp": tool_pattern,
+                    "act": action,
+                    "sc": scope,
+                    "rs": reason,
+                    "im": input_match,
+                    "pr": priority,
+                    "ts": time.time(),
+                },
+            )
+        return rule_id
+
+    def list_rules(self) -> list:
+        return self.query_all(
+            "MATCH (r:MCPRule) RETURN r.id, r.tool_pattern, r.action, r.scope, "
+            "r.reason, r.input_match, r.priority, r.created_at "
+            "ORDER BY r.priority DESC, r.created_at ASC"
+        )
+
+    def delete_rule(self, rule_id: str) -> bool:
+        with self._lock:
+            try:
+                self.connection.execute(
+                    "MATCH (r:MCPRule {id: $id}) DELETE r", {"id": rule_id}
+                )
+                return True
+            except Exception:
+                return False
 
     # ── read methods ─────────────────────────────────────────────────────────
 

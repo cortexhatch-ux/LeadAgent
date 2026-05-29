@@ -67,6 +67,22 @@ _TOOLS = [
     }
 ]
 
+def _evaluate_rule(tool_name: str) -> str:
+    """Return the rules-engine action for this tool (allow/deny/ask).
+    Falls back to 'ask' if the backend is unreachable."""
+    try:
+        resp = requests.post(
+            f"{BACKEND_URL}/rules/evaluate",
+            json={"tool_name": tool_name, "input": {}, "agent": "mcp", "session_id": SESSION_ID},
+            timeout=2,
+        )
+        if resp.ok:
+            return resp.json().get("action", "ask")
+    except Exception:
+        pass
+    return "ask"
+
+
 def _send(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -109,7 +125,15 @@ def _handle(msg: dict) -> None:
         })
 
     elif method == "tools/list":
-        _send({"jsonrpc": "2.0", "id": id_, "result": {"tools": _TOOLS}})
+        # Filter tools through rules before handing schemas to the agent.
+        # Any tool with a "deny" rule at this scope is stripped entirely —
+        # the agent never knows it exists.
+        visible = []
+        for tool in _TOOLS:
+            action = _evaluate_rule(tool["name"])
+            if action != "deny":
+                visible.append(tool)
+        _send({"jsonrpc": "2.0", "id": id_, "result": {"tools": visible}})
 
     elif method == "tools/call":
         params = msg.get("params", {})

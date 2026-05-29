@@ -135,9 +135,20 @@ class CLIAgent:
         stdin_data = prompt if use_stdin else None
         
         if self.command == "gemini":
-            flags = ["--skip-trust", "--approval-mode", mode]
+            # Map LeadAgent internal modes to Gemini's --approval-mode values:
+            #   "execute" → "yolo"    (auto-approve all, structural rules still enforce)
+            #   "plan"    → "default" (LeadAgent "plan" = ask before acting, NOT Gemini read-only)
+            #   anything else → "default"
+            gemini_mode = {"execute": "yolo"}.get(mode, "default")
+            flags = ["--skip-trust", "--approval-mode", gemini_mode]
             if not use_stdin:
                 flags = ["-p", prompt] + flags
+            return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
+
+        if self.command == "claude":
+            flags = ["-p"]
+            if not use_stdin:
+                flags = ["-p", prompt]
             return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
 
         if self.command == "grok" or self.command not in ("claude", "gemini", "codex"):
@@ -462,7 +473,7 @@ class OllamaAgent:
                     "stream": True,
                 },
                 stream=True,
-                timeout=5,
+                timeout=(10, 120),
             )
             response.raise_for_status()
             for line in response.iter_lines():
