@@ -5,7 +5,14 @@ LeadAgent is a structural mediator between your intent and the tools required to
 ```mermaid
 graph TD
     CLI[Go CLI] -->|Prompt + Context| Router[Python Backend Router]
-    Router -->|Query Task Affinity| DB[(KuzuDB\nGraph Memory)]
+
+    subgraph Memory Layer
+        AM[AgentMemory Service\nport 3111\nworking · episodic · semantic · procedural]
+        DB[(KuzuDB\nEntities · Relationships\nAffinity · MCPRules)]
+    end
+
+    Router -->|Semantic search before routing| AM
+    Router -->|Query task affinity + graph entities| DB
     Router -->|SLM Classification| Ollama[Ollama\nLocal LLM]
     Ollama -->|task_type, complexity, mode| Router
     Router -->|Selects Agent + Mode| MCP[MCP Permission Server]
@@ -19,17 +26,17 @@ graph TD
     end
 
     AgentIface -->|Tool Calls| Tools[Universal Tool Pool\nmain_mcp_server]
-    MCP -->|Validates / Blocks| Tools
-    Tools -.->|read_file, run_sql, write_file...| System[File System / KuzuDB]
+    MCP -->|Validates / Blocks via Rules Engine| Tools
+    Tools -.->|read_file, run_sql, write_file...| System[File System]
 
     Router -->|Debate Mode| Debate[Debate Engine\nGAN-style Multi-Agent]
     Debate -->|Parallel Rounds| AgentIface
 
-    Router -->|Store Outcomes| DB
-    AgentIface -->|Episodic Memory| MemClient[Memory Client]
-    MemClient -->|Tier: episodic/semantic| DB
+    AgentIface -->|Store Q+A episodic tier| AM
+    AgentIface -->|Store entities + affinity scores| DB
+    Debate -->|Store synthesis episodic tier| AM
 
-    Dashboard[Dashboard\nlocalhost:8000] -->|Live Routing + Tool Logs| Router
+    Dashboard[Dashboard\nlocalhost:8000] -->|Live Routing + Tool Logs + Rules| Router
 ```
 
 ## The Agent Router
@@ -87,6 +94,25 @@ curl -X DELETE http://localhost:8000/rules/<id>
 - **Fail-open to user** — if the rules service is unavailable, the call falls through to the user permission prompt rather than silently allowing or blocking.
 
 → See [MCP Rules](mcp-rules.md) for the full guide: rule fields, example sets, and why prompt instructions are not a substitute.
+
+## The Memory Layer
+
+LeadAgent uses two complementary stores that serve different roles:
+
+| | AgentMemory (port 3111) | KuzuDB |
+|---|---|---|
+| **What it stores** | Raw Q&A content, episodic history, semantic snippets | Entities, relationships, affinity scores, MCP rules |
+| **How it's queried** | Semantic similarity search against prompt text | Cypher graph queries, exact entity matching |
+| **When it's written** | After every successful agent response; after every debate synthesis | During context indexing; after routing decisions |
+| **Role in routing** | Injects relevant past conversations as background context | Injects matched entities + selects agent by affinity score |
+
+**Memory tiers** (AgentMemory):
+- `working` — current session scratchpad
+- `episodic` — completed Q&A pairs and debate syntheses
+- `semantic` — distilled facts extracted from responses
+- `procedural` — recurring patterns and learned workflows
+
+Both stores feed `check_memory()` in the router before every prompt is dispatched. The result is injected as background context — the agent sees relevant history without you repeating yourself across sessions or projects.
 
 ## Universal Context Discovery
 

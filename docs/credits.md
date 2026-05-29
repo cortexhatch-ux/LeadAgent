@@ -5,7 +5,7 @@ LeadAgent is built on the shoulders of these projects:
 ## Backend (Python)
 
 - [**KuzuDB**](http://kuzudb.github.io/docs) — embeddable graph database powering cross-project memory
-- [**AgentMemory**](https://github.com/rohitg00/agentmemory) — semantic storage and indexing layer
+- [**AgentMemory**](https://github.com/rohitg00/agentmemory) — multi-tier memory service (working/episodic/semantic/procedural); stores every Q&A and debate synthesis, provides semantic search for context injection before each prompt
 - [**FastAPI**](https://fastapi.tiangolo.com/) — high-performance routing gateway
 - [**Pydantic**](https://docs.pydantic.dev/) — strict data integrity
 - [**Pexpect**](https://pexpect.readthedocs.io/) — terminal interaction for subscription CLIs
