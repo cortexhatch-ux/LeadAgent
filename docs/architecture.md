@@ -21,7 +21,6 @@ graph TD
     subgraph Agents
         AgentIface -->|execute| Claude[Claude CLI]
         AgentIface -->|execute| Gemini[Gemini CLI]
-        AgentIface -->|execute| Grok[Grok CLI]
         AgentIface -->|execute| Codex[Codex CLI]
     end
 
@@ -90,7 +89,7 @@ curl -X DELETE http://localhost:8000/rules/<id>
 
 **Key properties:**
 - **Bypass resistance** — enforcement runs in Python outside the LLM's reasoning loop; prompt engineering cannot override it.
-- **Agent-agnostic** — the same rule blocks Claude, Gemini, and Grok equally.
+- **Agent-agnostic** — the same rule blocks Claude, Gemini, and Codex equally, and will apply to any agent added in future.
 - **Fail-open to user** — if the rules service is unavailable, the call falls through to the user permission prompt rather than silently allowing or blocking.
 
 → See [MCP Rules](mcp-rules.md) for the full guide: rule fields, example sets, and why prompt instructions are not a substitute.

@@ -116,7 +116,7 @@ Don't write prompt instructions as a substitute for rules. These patterns are fr
 "Do not execute shell commands."
 ```
 
-These belong in `CLAUDE.md` as a reminder, not as your actual enforcement mechanism. Write a rule instead — it works whether the agent is Claude, Gemini, Grok, or any future model LeadAgent supports.
+These belong in `CLAUDE.md` as a reminder, not as your actual enforcement mechanism. Write a rule instead — it works whether the agent is Claude, Gemini, Codex, or any future model LeadAgent supports.
 
 ## Failure behaviour
 
