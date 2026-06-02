@@ -3,18 +3,27 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textarea"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/lipgloss"
 	"golang.org/x/term"
 )
 
@@ -86,6 +95,41 @@ const (
 	Gray   = "\033[37m"
 	White  = "\033[97m"
 )
+
+// requestCancel holds the cancel func for the currently in-flight HTTP request.
+// SIGINT calls it so the request aborts and the REPL returns to the prompt.
+var (
+	requestCancel func() = func() {}
+	requestMu     sync.Mutex
+)
+
+func setRequestCancel(cancel func()) {
+	requestMu.Lock()
+	requestCancel = cancel
+	requestMu.Unlock()
+}
+
+func cancelCurrentRequest() {
+	requestMu.Lock()
+	f := requestCancel
+	requestCancel = func() {}
+	requestMu.Unlock()
+	f()
+}
+
+// initSigintHandler catches Ctrl+C and cancels the in-flight request instead
+// of killing the process. A second Ctrl+C with no request in flight exits.
+func initSigintHandler() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	go func() {
+		for range ch {
+			cancelCurrentRequest()
+			// Print on a fresh line so the prompt doesn't look garbled.
+			fmt.Printf("\r%s^C%s\n", Dim+Gray, Reset)
+		}
+	}()
+}
 
 // renderMarkdown renders markdown text using glamour with a dark theme.
 // Falls back to raw content if glamour produces nothing visible.
@@ -257,6 +301,7 @@ func runSetupWizard() {
 }
 
 func main() {
+	initSigintHandler()
 	go initProject()
 
 	skipOnboard := false
@@ -433,6 +478,8 @@ func ensureBackend() {
 	}
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	// Own process group so Ctrl+C in the CLI doesn't SIGINT the backend.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		fmt.Printf("%s  Failed to start backend: %v%s\n", Red, err, Reset)
 		return
@@ -451,6 +498,201 @@ func ensureBackend() {
 	fmt.Printf("%s\n%s  Backend did not respond in time — continuing anyway.%s\n", Reset, Yellow, Reset)
 }
 
+
+// ErrInterrupted is returned by readInput when Ctrl+C is pressed.
+var ErrInterrupted = errors.New("interrupted")
+
+// ── Bubbletea input model ─────────────────────────────────────────────────────
+
+type inputModel struct {
+	ta          textarea.Model
+	agent       string
+	role        string
+	cmdHistory  []string
+	histIdx     int
+	savedDraft  string
+	result      string
+	submitted   bool
+	interrupted bool
+	width       int
+}
+
+func newInputModel(agent, role string, history []string, width int) inputModel {
+	ta := textarea.New()
+	ta.Placeholder = "Type a message…"
+	ta.Focus()
+	ta.CharLimit = 0
+	ta.ShowLineNumbers = false
+	ta.SetWidth(width - 4)
+	ta.SetHeight(1)
+	// Remap Enter so it inserts a real newline only on Alt+Enter;
+	// plain Enter is intercepted in Update() to submit.
+	ta.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("alt+enter"))
+
+	agentColor := lipgloss.Color("99") // purple default
+	switch strings.ToLower(agent) {
+	case "gemini":
+		agentColor = lipgloss.Color("33")
+	case "codex":
+		agentColor = lipgloss.Color("46")
+	case "grok":
+		agentColor = lipgloss.Color("220")
+	}
+
+	border := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(agentColor).
+		Padding(0, 1)
+	dimBorder := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(0, 1)
+
+	ta.FocusedStyle.Base = border
+	ta.BlurredStyle.Base = dimBorder
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+
+	return inputModel{
+		ta:         ta,
+		agent:      agent,
+		role:       role,
+		cmdHistory: history,
+		histIdx:    len(history),
+		width:      width,
+	}
+}
+
+func (m inputModel) Init() tea.Cmd { return textarea.Blink }
+
+func (m inputModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.ta.SetWidth(msg.Width - 4)
+		return m, nil
+
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyCtrlC:
+			m.interrupted = true
+			return m, tea.Quit
+
+		case tea.KeyEnter:
+			if !msg.Alt {
+				val := strings.TrimSpace(m.ta.Value())
+				if val != "" {
+					m.result = m.ta.Value()
+					m.submitted = true
+					return m, tea.Quit
+				}
+				return m, nil
+			}
+
+		case tea.KeyUp:
+			if m.ta.Line() == 0 && m.histIdx > 0 {
+				if m.histIdx == len(m.cmdHistory) {
+					m.savedDraft = m.ta.Value()
+				}
+				m.histIdx--
+				m.ta.SetValue(m.cmdHistory[m.histIdx])
+				m.ta.CursorEnd()
+				lines := strings.Count(m.ta.Value(), "\n") + 1
+				m.ta.SetHeight(lines)
+				return m, nil
+			}
+
+		case tea.KeyDown:
+			lineCount := strings.Count(m.ta.Value(), "\n") + 1
+			if m.ta.Line() == lineCount-1 && m.histIdx < len(m.cmdHistory) {
+				m.histIdx++
+				if m.histIdx == len(m.cmdHistory) {
+					m.ta.SetValue(m.savedDraft)
+				} else {
+					m.ta.SetValue(m.cmdHistory[m.histIdx])
+				}
+				m.ta.CursorEnd()
+				lines := strings.Count(m.ta.Value(), "\n") + 1
+				m.ta.SetHeight(lines)
+				return m, nil
+			}
+		}
+	}
+
+	prevLines := strings.Count(m.ta.Value(), "\n")
+	var cmd tea.Cmd
+	m.ta, cmd = m.ta.Update(msg)
+	newLines := strings.Count(m.ta.Value(), "\n")
+	if newLines != prevLines {
+		h := newLines + 1
+		if h < 1 {
+			h = 1
+		}
+		m.ta.SetHeight(h)
+	}
+	return m, cmd
+}
+
+func (m inputModel) View() string {
+	agentLabel := "auto"
+	agentColor := lipgloss.Color("240")
+	if m.agent != "" {
+		agentLabel = m.agent
+		switch strings.ToLower(m.agent) {
+		case "claude":
+			agentColor = lipgloss.Color("99")
+		case "gemini":
+			agentColor = lipgloss.Color("33")
+		case "codex":
+			agentColor = lipgloss.Color("46")
+		case "grok":
+			agentColor = lipgloss.Color("220")
+		}
+	}
+	nameStyle := lipgloss.NewStyle().Bold(true).Foreground(agentColor)
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+
+	header := nameStyle.Render("brain("+agentLabel+")")
+	if m.role != "" && m.role != "general" {
+		header += dimStyle.Render(":" + m.role)
+	}
+	header += dimStyle.Render("  ↵ send · ↑↓ history · alt+↵ newline")
+
+	return "\n" + header + "\n" + m.ta.View() + "\n"
+}
+
+// readInput runs the bubbletea input box and returns the submitted text.
+func readInput(agent, role string, history []string) (string, error) {
+	// Non-interactive fallback (pipes, scripts)
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		sc := bufio.NewScanner(os.Stdin)
+		sc.Buffer(make([]byte, 10<<20), 10<<20)
+		if sc.Scan() {
+			return sc.Text(), nil
+		}
+		return "", io.EOF
+	}
+
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width < 40 {
+		width = 80
+	}
+
+	m := newInputModel(agent, role, history, width)
+	p := tea.NewProgram(m, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
+	final, err := p.Run()
+	if err != nil {
+		return "", err
+	}
+	fm := final.(inputModel)
+	if fm.interrupted {
+		return "", ErrInterrupted
+	}
+	if fm.submitted {
+		return fm.result, nil
+	}
+	return "", io.EOF
+}
+
 func startREPL() {
 	ensureBackend()
 	drawDashboard()
@@ -460,26 +702,23 @@ func startREPL() {
 	currentRole := "general"
 	sessionID := fmt.Sprintf("session-%d", os.Getpid())
 	history := []conversationTurn{}
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024) // 10MB — handles large pastes
+	var cmdHistory []string // input box history (up/down arrows)
 
 	for {
-		agentDisplay := Dim + "auto" + Reset
-		if currentAgent != "" {
-			agentDisplay = getAgentColor(currentAgent) + currentAgent + Reset
+		input, err := readInput(currentAgent, currentRole, cmdHistory)
+		if errors.Is(err, ErrInterrupted) {
+			continue
 		}
-		roleDisplay := ""
-		if currentRole != "general" {
-			roleDisplay = Dim + Gray + ":" + currentRole + Reset
-		}
-
-		fmt.Printf("%s%sbrain%s(%s%s)%s ❯ %s", Bold+Cyan, "", Reset, agentDisplay, roleDisplay, Bold+Cyan, Reset)
-
-		if !scanner.Scan() {
+		if err != nil {
 			break
 		}
-		input := scanner.Text()
 		trimmed := strings.TrimSpace(input)
+		if trimmed != "" {
+			cmdHistory = append(cmdHistory, trimmed)
+			if len(cmdHistory) > 500 {
+				cmdHistory = cmdHistory[len(cmdHistory)-500:]
+			}
+		}
 
 		if trimmed == "exit" || trimmed == "quit" {
 			fmt.Printf("\n%sGoodbye.%s\n", Dim, Reset)
@@ -804,47 +1043,58 @@ func printLiveProgress(line string) {
 }
 
 // startSpinner shows an animated spinner with elapsed time.
-// Call the returned stop() when the response arrives to clear the line.
-func startSpinner(agent string) func() {
+// Returns (stop, updateLabel). Call stop() to clear; call updateLabel(msg) to
+// change the status text shown next to the spinner without stopping it.
+func startSpinner(agent string) (stop func(), updateLabel func(string)) {
 	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	done := make(chan struct{})
 	start := time.Now()
 
-	label := "Thinking"
+	initLabel := "Thinking"
 	color := Dim + Gray
 	if agent != "" {
-		label = strings.ToUpper(agent)
+		initLabel = strings.ToUpper(agent)
 		color = getAgentColor(agent)
 	}
+
+	var mu sync.Mutex
+	currentLabel := initLabel
+	currentColor := color
 
 	go func() {
 		for i := 0; ; i++ {
 			select {
 			case <-done:
-				fmt.Printf("\r%-60s\r", "")
+				fmt.Printf("\r%-80s\r", "")
 				return
 			default:
+				mu.Lock()
+				lbl := currentLabel
+				clr := currentColor
+				mu.Unlock()
+
 				elapsed := int(time.Since(start).Seconds())
-				c := color
-				suffix := ""
-				if elapsed >= 30 {
-					c = Yellow
-					suffix = " — slow response, still waiting"
-				}
-				fmt.Printf("\r%s%s%s %s%s...%s (%ds%s)",
-					c, frames[i%len(frames)], Reset,
-					Dim, label, Reset,
-					elapsed, suffix,
+				fmt.Printf("\r%s%s%s %s%s%s (%ds)",
+					clr, frames[i%len(frames)], Reset,
+					Dim+Gray, lbl, Reset,
+					elapsed,
 				)
 				time.Sleep(80 * time.Millisecond)
 			}
 		}
 	}()
 
-	return func() {
+	stop = func() {
 		close(done)
-		time.Sleep(90 * time.Millisecond) // let goroutine print the clear
+		time.Sleep(90 * time.Millisecond)
 	}
+	updateLabel = func(msg string) {
+		mu.Lock()
+		currentLabel = msg
+		currentColor = Dim + Gray
+		mu.Unlock()
+	}
+	return
 }
 
 // conversationTurn holds one user/assistant exchange for the rolling context window.
@@ -979,11 +1229,30 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 		return ""
 	}
 
-	stopSpinner := startSpinner(agent)
+	stopSpinner, updateSpinner := startSpinner(agent)
 
-	resp, err := http.Post("http://localhost:8000/chat", "application/json", bytes.NewBuffer(jsonData))
+	ctx, cancel := context.WithCancel(context.Background())
+	setRequestCancel(cancel)
+	defer func() {
+		cancel()
+		setRequestCancel(func() {})
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost:8000/chat", bytes.NewBuffer(jsonData))
 	if err != nil {
 		stopSpinner()
+		fmt.Printf("%s  Error building request: %v%s\n", Red, err, Reset)
+		return ""
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		stopSpinner()
+		if errors.Is(err, context.Canceled) {
+			fmt.Printf("%s  Request cancelled.%s\n", Yellow, Reset)
+			return ""
+		}
 		fmt.Printf("%s  Error connecting to LeadAgent daemon: %v%s\n", Red, err, Reset)
 		return ""
 	}
@@ -1003,9 +1272,7 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 		spinnerStopped := false
 		progressHeaderShown := false
 
-		// timingLines collects all __TIMING__ payloads (one per agent + summary for fan-out)
 		var timingLines []string
-		// fanout state: when we see the ━━━ separator we flush the current agent block
 		type agentBlock struct {
 			name    string
 			content strings.Builder
@@ -1020,6 +1287,15 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 			if line != "" {
 				trimmed := strings.TrimSpace(line)
 
+				// Status update from backend — update spinner label, never print
+				if strings.HasPrefix(trimmed, "__STATUS__:") {
+					msg := strings.TrimPrefix(trimmed, "__STATUS__:")
+					if !spinnerStopped {
+						updateSpinner(msg)
+					}
+					continue
+				}
+
 				if !spinnerStopped && strings.HasPrefix(line, "Using CLI Agent:") {
 					parts := strings.SplitN(line, ":", 2)
 					if len(parts) == 2 {
@@ -1027,7 +1303,7 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 						currentBlock.name = agentName
 					}
 					stopSpinner()
-					stopSpinner = startSpinner(agentName)
+					stopSpinner, updateSpinner = startSpinner(agentName)
 					spinnerStopped = false
 					continue
 				}
@@ -1044,15 +1320,14 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 						spinnerStopped = true
 					}
 					handlePermissionRequest(payload)
-					stopSpinner = startSpinner(agentName)
+					stopSpinner, updateSpinner = startSpinner(agentName)
 					spinnerStopped = false
 					continue
 				}
 
-				// Fan-out agent separator: ━━━━...\n◆  AGENTNAME\n━━━━...
+				// Fan-out agent separator
 				if strings.HasPrefix(trimmed, "◆  ") {
 					isFanout = true
-					// Save previous block, start new one
 					blocks = append(blocks, *currentBlock)
 					newName := strings.ToLower(strings.TrimPrefix(trimmed, "◆  "))
 					currentBlock = &agentBlock{name: newName}
@@ -1061,11 +1336,10 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 						stopSpinner()
 						spinnerStopped = true
 					}
-					stopSpinner = startSpinner(agentName)
+					stopSpinner, updateSpinner = startSpinner(agentName)
 					spinnerStopped = false
 					continue
 				}
-				// Skip the ━━━ separator lines themselves
 				if strings.HasPrefix(trimmed, "━━━") {
 					continue
 				}
@@ -1093,7 +1367,6 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 				break
 			}
 		}
-		// Flush last block
 		blocks = append(blocks, *currentBlock)
 
 		if !spinnerStopped {
@@ -1104,8 +1377,7 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 		}
 
 		if isFanout {
-			// Render each agent block with its own header + timing
-			agentTimings := map[string]string{} // agent -> timing JSON
+			agentTimings := map[string]string{}
 			for _, tl := range timingLines {
 				var tm map[string]interface{}
 				if json.Unmarshal([]byte(tl), &tm) == nil {
@@ -1125,7 +1397,6 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 				}
 				fmt.Println()
 			}
-			// Print overall summary timing (last entry has agents[] + total)
 			if len(timingLines) > 0 {
 				printTimingLedger(timingLines[len(timingLines)-1])
 			}
@@ -1260,7 +1531,7 @@ func sendDebate(prompt string, rounds int, agents []string, cwd string, force bo
 					stopSpin()
 					spinRunning = false
 				}
-				stopSpin = startSpinner("umpire")
+				stopSpin, _ = startSpinner("umpire")
 				spinRunning = true
 				continue
 			}
@@ -1292,7 +1563,7 @@ func sendDebate(prompt string, rounds int, agents []string, cwd string, force bo
 				if spinRunning {
 					stopSpin()
 				}
-				stopSpin = startSpinner(currentAgent)
+				stopSpin, _ = startSpinner(currentAgent)
 				spinRunning = true
 				continue
 			}

@@ -29,9 +29,15 @@ def _cli_available(agent: str) -> bool:
 # ── Rule-based task classifier (no API call, no quota spend) ─────────────────
 
 _EXECUTE_PATTERN = re.compile(
+    # File edit operations
     r"\b(edit|update|modify|change|fix|rewrite|replace|add to|insert|delete from|remove from|refactor|rename)\b.{0,80}"
     r"\.(md|py|go|ts|js|json|yaml|yml|txt|sh|toml|cfg|env|html|css)\b"
-    r"|\b(update|edit|modify|change|fix|rewrite)\b.{0,40}\b(readme|config|file|script|template|dockerfile)\b",
+    r"|\b(update|edit|modify|change|fix|rewrite)\b.{0,40}\b(readme|config|file|script|template|dockerfile)\b"
+    # Git / shell operations
+    r"|\b(push|commit|branch|checkout|merge|rebase|pull request|PR|open a PR|create a PR|create.*branch|git)\b"
+    r"|\b(run|execute|install|build|deploy|start|stop|restart|test|lint|format|compile)\b.{0,40}"
+    r"\b(command|script|server|backend|frontend|docker|container|service|process)\b"
+    r"|\b(make.*changes|apply.*changes|check.*changes|move.*changes)\b",
     re.IGNORECASE | re.DOTALL,
 )
 
