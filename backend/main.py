@@ -470,6 +470,8 @@ def _stream_agent(
     threading.Thread(target=_run_agent, daemon=True).start()
 
     agent_done = False
+    last_heartbeat = _time.perf_counter()
+    heartbeat_interval = 8   # seconds between status pings when agent is silent
     while not agent_done:
         while perm_q is not None:
             try:
@@ -481,6 +483,19 @@ def _stream_agent(
         try:
             kind, val = chunk_q.get(timeout=0.05)
         except _queue.Empty:
+            now = _time.perf_counter()
+            elapsed = int(now - t3)
+            if now - last_heartbeat >= heartbeat_interval:
+                last_heartbeat = now
+                if elapsed < 15:
+                    msg = f"{agent_name} thinking... ({elapsed}s)"
+                elif elapsed < 30:
+                    msg = f"{agent_name} still working... ({elapsed}s)"
+                elif elapsed < 60:
+                    msg = f"{agent_name} taking longer than usual... ({elapsed}s)"
+                else:
+                    msg = f"{agent_name} very slow response — may be rate-limited ({elapsed}s)"
+                yield f"__STATUS__:{msg}\n"
             continue
 
         if kind == "done":
@@ -561,50 +576,51 @@ def _stream_agent(
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    t0 = _time.perf_counter()
-
-    # STEP 1: Enrich prompt with graph + memory context (delta only for this session)
-    # Default context is 'primary'
-    memory_hit = agent_router.check_memory(request.prompt, request.session_id)
-    t1 = _time.perf_counter()
-    injected_context = ""
-    if memory_hit:
-        injected_context = (
-            "=== BACKGROUND CONTEXT (for reference only — do NOT act on this unless the user's task below explicitly requires it) ===\n"
-            f"{memory_hit}\n"
-            "=== END BACKGROUND CONTEXT ===\n\n"
-        )
-
-    # STEP 2: Route — may return multiple agents for fan-out requests
-    agent_names, metadata = agent_router.route_multi(
-        request.task_type, request.prompt, request.preferred_agent
-    )
-    t2 = _time.perf_counter()
-
-    if agent_names == ["none"]:
-        raise HTTPException(
-            status_code=503,
-            detail="No agents available (not installed or authenticated).",
-        )
-
-    mode = metadata.get("mode", "plan")
-    reasoning = metadata.get("internal_reasoning")
-
-    full_prompt = injected_context + f"=== YOUR TASK ===\n{request.prompt}\n=== END TASK ==="
-    if reasoning:
-        full_prompt = f"=== INTERNAL REASONING (DO NOT SHOW TO USER) ===\n{reasoning}\n=== END REASONING ===\n\n" + full_prompt
-
-    is_fanout = len(agent_names) > 1
-    # Parallel if explicitly requested OR natural language signals it
-    run_parallel = request.parallel or (
-        is_fanout and agent_router.detect_parallel(request.prompt)
-    )
 
     def _sep(name: str) -> str:
         s = "━" * 60
         return f"\n{s}\n◆  {name.upper()}\n{s}\n"
 
+    def _status(msg: str) -> str:
+        return f"__STATUS__:{msg}\n"
+
     def cli_generator():
+        # ── Step 1: memory lookup ──────────────────────────────────────────
+        yield _status("Checking context memory...")
+        t0 = _time.perf_counter()
+        memory_hit = agent_router.check_memory(request.prompt, request.session_id)
+        t1 = _time.perf_counter()
+        injected_context = ""
+        if memory_hit:
+            injected_context = (
+                "=== BACKGROUND CONTEXT (for reference only — do NOT act on this unless the user's task below explicitly requires it) ===\n"
+                f"{memory_hit}\n"
+                "=== END BACKGROUND CONTEXT ===\n\n"
+            )
+
+        # ── Step 2: routing ───────────────────────────────────────────────
+        yield _status("Routing to best agent...")
+        agent_names, metadata = agent_router.route_multi(
+            request.task_type, request.prompt, request.preferred_agent
+        )
+        t2 = _time.perf_counter()
+
+        if agent_names == ["none"]:
+            yield "❌ No agents available (not installed or authenticated).\n"
+            return
+
+        mode = metadata.get("mode", "plan")
+        reasoning = metadata.get("internal_reasoning")
+
+        full_prompt = injected_context + f"=== YOUR TASK ===\n{request.prompt}\n=== END TASK ==="
+        if reasoning:
+            full_prompt = f"=== INTERNAL REASONING (DO NOT SHOW TO USER) ===\n{reasoning}\n=== END REASONING ===\n\n" + full_prompt
+
+        is_fanout = len(agent_names) > 1
+        run_parallel = request.parallel or (
+            is_fanout and agent_router.detect_parallel(request.prompt)
+        )
+
         if (
             request.preferred_agent
             and agent_names[0] != request.preferred_agent

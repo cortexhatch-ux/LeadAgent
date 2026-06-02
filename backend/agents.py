@@ -204,6 +204,7 @@ class CLIAgent:
             bufsize=0,
             cwd=local_cwd,
             env=env,
+            start_new_session=True,
         )
 
         try:
@@ -267,6 +268,7 @@ class CLIAgent:
             bufsize=0,
             cwd=local_cwd,
             env=env,
+            start_new_session=True,
         )
 
         try:
@@ -377,6 +379,7 @@ class CLIAgent:
             bufsize=0,
             cwd=local_cwd,
             env=env,
+            start_new_session=True,
         )
 
         def _log_stderr():

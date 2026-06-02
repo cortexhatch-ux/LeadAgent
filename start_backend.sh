@@ -4,63 +4,119 @@ cd "$(dirname "$0")"
 
 DAEMON_MODE=false
 FORCE_NATIVE=false
+SERVICES=()   # empty = restart everything (original behaviour)
+
 for arg in "$@"; do
-    if [ "$arg" == "--daemon" ] || [ "$arg" == "-d" ]; then
-        DAEMON_MODE=true
-    fi
-    if [ "$arg" == "--native" ] || [ "$arg" == "-n" ]; then
-        FORCE_NATIVE=true
-    fi
+    case "$arg" in
+        --daemon|-d)    DAEMON_MODE=true ;;
+        --native|-n)    FORCE_NATIVE=true ;;
+        backend|agentmemory|ollama) SERVICES+=("$arg") ;;
+        --help|-h)
+            echo "Usage: $0 [--daemon] [--native] [service ...]"
+            echo ""
+            echo "  No service args   — full restart (default)"
+            echo "  backend           — restart only the FastAPI backend"
+            echo "  agentmemory       — restart only the agentmemory server"
+            echo "  ollama            — restart only the Ollama server"
+            echo ""
+            echo "Examples:"
+            echo "  $0                        # full restart"
+            echo "  $0 backend                # restart just the backend"
+            echo "  $0 --daemon backend       # restart backend in background"
+            echo "  $0 agentmemory ollama     # restart agentmemory + ollama"
+            exit 0
+            ;;
+        *) echo "⚠️  Unknown argument: $arg (ignored)" ;;
+    esac
 done
+
+# Helper: should we touch this service?
+wants() { [ ${#SERVICES[@]} -eq 0 ] || printf '%s\n' "${SERVICES[@]}" | grep -qx "$1"; }
 
 # Ensure runtime directories exist
 mkdir -p leadagent-data data
 
-echo "🧹 Cleaning up existing LeadAgent processes..."
-
-# 1. Surgical kill: Target only processes tagged with LEADAGENT_TAG=true
-PIDS=$(pgrep -f "LEADAGENT_TAG=true" || true)
-if [ ! -z "$PIDS" ]; then
-    for PID in $PIDS; do
-        echo "   Terminating tagged LeadAgent process $PID..."
-        kill -9 $PID 2>/dev/null || true
-    done
+# ── Build Go CLI if sources are newer than the binary ────────────────────────
+CLI_BIN="cli/leadagent"
+CLI_SRC="cli/main.go"
+if command -v go &>/dev/null; then
+    if [ ! -f "$CLI_BIN" ] || [ "$CLI_SRC" -nt "$CLI_BIN" ] || [ "cli/go.mod" -nt "$CLI_BIN" ]; then
+        echo "🔨 Rebuilding leadagent CLI..."
+        (cd cli && go build -o leadagent . && echo "   ✓ CLI built: cli/leadagent")
+    fi
+else
+    echo "⚠️  go not found — skipping CLI build (install Go to enable auto-build)"
 fi
 
-# 2. Safety sweep for ports (8000 for FastAPI, 3111 for AgentMemory, 11434 for Ollama)
-# Only kill if the process on that port is tagged as ours
-for port in 8000 3111 11434; do
-    PIDS=$(lsof -ti :$port || true)
-    if [ ! -z "$PIDS" ]; then
+# ── Kill / stop selected services ────────────────────────────────────────────
+
+stop_native_service() {
+    local port=$1 label=$2
+    # Kill by tag first
+    local PIDS
+    PIDS=$(pgrep -f "LEADAGENT_TAG=true" 2>/dev/null || true)
+    if [ -n "$PIDS" ]; then
         for PID in $PIDS; do
-            # Check if the process command line contains our tag
-            if ps -p $PID -o args= 2>/dev/null | grep -q "LEADAGENT_TAG=true"; then
-                echo "   Killing tagged LeadAgent process $PID holding port $port..."
-                kill -9 $PID 2>/dev/null || true
+            if ps -p "$PID" -o args= 2>/dev/null | grep -q "$label"; then
+                echo "   Terminating $label process $PID..."
+                kill -9 "$PID" 2>/dev/null || true
             fi
         done
     fi
-done
+    # Port sweep
+    local PORT_PIDS
+    PORT_PIDS=$(lsof -ti :"$port" 2>/dev/null || true)
+    if [ -n "$PORT_PIDS" ]; then
+        for PID in $PORT_PIDS; do
+            if ps -p "$PID" -o args= 2>/dev/null | grep -q "LEADAGENT_TAG=true"; then
+                echo "   Killing tagged process $PID on port $port..."
+                kill -9 "$PID" 2>/dev/null || true
+            fi
+        done
+    fi
+}
 
-# Allow a moment for ports to be released
+if wants backend; then
+    echo "🧹 Stopping backend (port 8000)..."
+    stop_native_service 8000 "main.py"
+fi
+if wants agentmemory; then
+    echo "🧹 Stopping agentmemory (port 3111)..."
+    stop_native_service 3111 "agentmemory"
+fi
+if wants ollama; then
+    echo "🧹 Stopping ollama (port 11434)..."
+    stop_native_service 11434 "ollama"
+fi
+
+# Full-restart also cleans up anything else tagged as ours
+if [ ${#SERVICES[@]} -eq 0 ]; then
+    echo "🧹 Cleaning up all LeadAgent processes..."
+    PIDS=$(pgrep -f "LEADAGENT_TAG=true" 2>/dev/null || true)
+    if [ -n "$PIDS" ]; then
+        for PID in $PIDS; do
+            echo "   Terminating tagged LeadAgent process $PID..."
+            kill -9 "$PID" 2>/dev/null || true
+        done
+    fi
+fi
+
 sleep 1
 
-# Export the tag for all subsequent commands in this script
 export LEADAGENT_TAG=true
 
-# Load workspace path from config.json (Consensus Round 6)
+# Load workspace path from config.json
 CONFIG_FILE="leadagent-data/config.json"
-# Discover local workspace (default to home directory)
 WORKSPACE="${LEADAGENT_WORKSPACE:-$HOME}"
 if [ -f "$CONFIG_FILE" ]; then
     SAVED_PATH=$(grep -o '"projects_dir": "[^"]*' "$CONFIG_FILE" | cut -d'"' -f4)
-    if [ ! -z "$SAVED_PATH" ]; then
+    if [ -n "$SAVED_PATH" ]; then
         WORKSPACE="$SAVED_PATH"
     fi
 fi
 export LEADAGENT_WORKSPACE="$WORKSPACE"
 
-# ── Service Launchers ─────────────────────────────────────────────────────────
+# ── Service launchers ─────────────────────────────────────────────────────────
 
 start_agentmemory() {
     if command -v agentmemory &>/dev/null; then
@@ -79,9 +135,7 @@ start_ollama() {
     if command -v ollama &>/dev/null; then
         if ! nc -z localhost 11434 2>/dev/null; then
             echo "   Starting Ollama server..."
-            # Launch with tag. 'ollama serve' is the standard way to start the background daemon.
             env LEADAGENT_TAG=true ollama serve &>leadagent-data/ollama.log &
-            # Wait a moment for it to bind
             sleep 2
         else
             echo "   Ollama already running on port 11434."
@@ -91,18 +145,38 @@ start_ollama() {
     fi
 }
 
-# ── Docker mode (preferred — no system file writes required) ─────────────────
+# ── Docker mode ───────────────────────────────────────────────────────────────
 if [ "$FORCE_NATIVE" = false ] && docker info &>/dev/null; then
     echo "🐳 Docker is running — starting LeadAgent via Docker Compose..."
     echo "   Workspace mirrored: $LEADAGENT_WORKSPACE"
 
-    start_agentmemory
-    # If using Docker, we let Docker Compose handle Ollama unless the user has it natively
-    if ! nc -z localhost 11434 2>/dev/null; then
-        echo "   Ollama not detected natively, will use Docker container..."
+    if wants agentmemory; then
+        start_agentmemory
     fi
 
-    docker compose up -d --build
+    if [ ${#SERVICES[@]} -eq 0 ]; then
+        # Full restart: rebuild everything
+        if wants agentmemory; then : ; else start_agentmemory; fi
+        if ! nc -z localhost 11434 2>/dev/null; then
+            echo "   Ollama not detected natively, will use Docker container..."
+        fi
+        docker compose up -d --build
+    else
+        # Selective: only act on named docker-compose services
+        COMPOSE_SERVICES=()
+        for svc in "${SERVICES[@]}"; do
+            case "$svc" in
+                backend)     COMPOSE_SERVICES+=("backend") ;;
+                ollama)      COMPOSE_SERVICES+=("ollama") ;;
+                agentmemory) ;;   # handled natively above
+            esac
+        done
+        if [ ${#COMPOSE_SERVICES[@]} -gt 0 ]; then
+            echo "   Restarting docker compose services: ${COMPOSE_SERVICES[*]}"
+            docker compose up -d --build "${COMPOSE_SERVICES[@]}"
+        fi
+    fi
+
     echo ""
     echo "🚀 LeadAgent is running."
     echo "   Logs:    docker compose logs -f backend"
@@ -111,35 +185,34 @@ if [ "$FORCE_NATIVE" = false ] && docker info &>/dev/null; then
     exit 0
 fi
 
-# ── Native fallback (launchd, no Docker) ─────────────────────────────────────
+# ── Native fallback ───────────────────────────────────────────────────────────
 echo "⚠️  Docker not available — starting natively..."
 export PYTHONPATH=$PYTHONPATH:.
-# Carry the user's full PATH so the backend can find CLIs (claude, gemini, etc.)
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-start_agentmemory
-start_ollama
+if wants agentmemory; then start_agentmemory; fi
+if wants ollama;      then start_ollama;      fi
 
-# Find the venv python — prefer ./leadagent, then legacy ./venv, fall back to system
-PYTHON=""
-for p in ./leadagent/bin/python3 ./leadagent/bin/python ./venv/bin/python3 ./venv/bin/python python3 python; do
-    if [ -x "$p" ] || command -v "$p" &>/dev/null; then
-        PYTHON="$p"
-        break
+if wants backend; then
+    # Find venv python
+    PYTHON=""
+    for p in ./leadagent/bin/python3 ./leadagent/bin/python ./venv/bin/python3 ./venv/bin/python python3 python; do
+        if [ -x "$p" ] || command -v "$p" &>/dev/null; then
+            PYTHON="$p"
+            break
+        fi
+    done
+
+    if [ -z "$PYTHON" ]; then
+        echo "❌ Error: no Python found. Run ./install.sh to create the leadagent venv."
+        exit 1
     fi
-done
 
-if [ -z "$PYTHON" ]; then
-    echo "❌ Error: no Python found. Run ./install.sh to create the leadagent venv."
-    exit 1
-fi
-
-echo "🚀 Launching FastAPI daemon..."
-if [ "$DAEMON_MODE" = true ]; then
-    echo "   Running in background. Logs: leadagent-data/daemon.log"
-    # Pass tag as an argument so it shows up in ps/pgrep on all platforms (e.g. Darwin)
-    nohup env LEADAGENT_TAG=true "$PYTHON" backend/main.py LEADAGENT_TAG=true > leadagent-data/daemon.log 2>&1 &
-else
-    # Pass tag as an argument so it shows up in ps/pgrep on all platforms (e.g. Darwin)
-    exec env LEADAGENT_TAG=true "$PYTHON" backend/main.py LEADAGENT_TAG=true
+    echo "🚀 Launching FastAPI daemon..."
+    if [ "$DAEMON_MODE" = true ]; then
+        echo "   Running in background. Logs: leadagent-data/daemon.log"
+        nohup env LEADAGENT_TAG=true "$PYTHON" backend/main.py LEADAGENT_TAG=true > leadagent-data/daemon.log 2>&1 &
+    else
+        exec env LEADAGENT_TAG=true "$PYTHON" backend/main.py LEADAGENT_TAG=true
+    fi
 fi
