@@ -39,7 +39,7 @@ leadagent health
 # → backend: ok  agentmemory: ok  ollama: ok (if installed)
 ```
 
-Open the dashboard: [http://localhost:5173](http://localhost:5173)
+Open the dashboard: [http://localhost:8000/dashboard](http://localhost:8000/dashboard)
 
 Send your first prompt:
 
