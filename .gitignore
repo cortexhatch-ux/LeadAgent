@@ -21,6 +21,7 @@ usage/
 # Temporary / Debug
 *.txt
 *.png
+!docs/screenshots/*.png
 debug_scrape.py
  debate.txt
  debate_output.txt
