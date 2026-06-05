@@ -520,23 +520,27 @@ def _stream_agent(
 
             db.log_agent_failure(agent_name, etype.value)
 
+            context_cache.prune_by_tag(request.session_id, tag)
+            fallback = agent_router.get_fallback(agent_name, etype)
+
             if etype == ErrorType.TRANSIENT_CAPACITY:
-                yield f"\n⚠️  {agent_name} is temporarily overloaded (429 Capacity). Please try again in a few seconds.\n"
-            else:
-                yield f"\n❌ {agent_name} failed ({etype.value}): {e}\n"
-
-                # Deterministic Rollback (Consensus Round 3)
-                context_cache.prune_by_tag(request.session_id, tag)
-
-                fallback = agent_router.get_fallback(agent_name, etype)
                 if fallback:
-                    yield f"🔄 Rollback & Fallback: Switching to {fallback}...\n"
-                    # Re-run with the fallback agent
+                    yield f"__STATUS__:{agent_name} quota exhausted — switching to {fallback}...\n"
                     yield from _stream_agent(
                         fallback, full_prompt, request, None, tag="fallback", mode=mode
                     )
                 else:
-                    # Log failure to affinity
+                    yield f"\n⚠️  {agent_name} quota exhausted and no fallback available. Try again later.\n"
+                    agent_router.update_outcome(request.task_type, agent_name, success=False)
+            else:
+                yield f"\n❌ {agent_name} failed ({etype.value}): {e}\n"
+
+                if fallback:
+                    yield f"🔄 Rollback & Fallback: Switching to {fallback}...\n"
+                    yield from _stream_agent(
+                        fallback, full_prompt, request, None, tag="fallback", mode=mode
+                    )
+                else:
                     agent_router.update_outcome(
                         request.task_type, agent_name, success=False
                     )

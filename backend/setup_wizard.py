@@ -204,7 +204,7 @@ class SetupWizard:
         self.root.title("LeadAgent Setup")
         self.root.resizable(False, False)
         self.root.configure(bg=BG)
-        self.root.geometry("900x640")
+        self.root.geometry("900x680")
         self._center()
 
         # Pre-fill selection from any previous run + installed CLIs
@@ -256,7 +256,7 @@ class SetupWizard:
     def _center(self):
         self.root.update_idletasks()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        self.root.geometry(f"900x640+{(sw - 900) // 2}+{(sh - 640) // 2}")
+        self.root.geometry(f"900x680+{(sw - 900) // 2}+{(sh - 680) // 2}")
 
     # ── Chrome ────────────────────────────────────────────────────────────────
 
@@ -280,12 +280,14 @@ class SetupWizard:
 
         right = tk.Frame(self.root, bg=BG)
         right.pack(side="left", fill="both", expand=True)
-        self.area = tk.Frame(right, bg=BG)
-        self.area.pack(fill="both", expand=True)
 
+        # Pack bottom bar FIRST so it stays visible
         bar = tk.Frame(right, bg=SIDEBAR, height=56)
         bar.pack(side="bottom", fill="x")
         bar.pack_propagate(False)
+
+        self.area = tk.Frame(right, bg=BG)
+        self.area.pack(fill="both", expand=True)
         self.btn_next = tk.Button(
             bar,
             text="Continue →",
@@ -412,7 +414,7 @@ class SetupWizard:
 
     def _content(self):
         f = tk.Frame(self.area, bg=BG)
-        f.pack(fill="both", expand=True, padx=34, pady=26)
+        f.pack(fill="both", expand=True, padx=34, pady=16)
         return f
 
     # ── Step: Welcome ─────────────────────────────────────────────────────────
@@ -473,15 +475,15 @@ class SetupWizard:
             bg=BG,
             fg=TEXT,
             font=(SANS, FONT_SIZE_L),
-        ).pack(anchor="w", pady=(6, 24))
+        ).pack(anchor="w", pady=(4, 16))
 
         self._chk: dict[str, tk.BooleanVar] = {}
         for key in AGENT_ORDER:
             spec = AGENTS[key]
             var = tk.BooleanVar(value=key in self.selected)
             self._chk[key] = var
-            card = tk.Frame(f, bg=CARD, padx=20, pady=18)
-            card.pack(fill="x", pady=6)
+            card = tk.Frame(f, bg=CARD, padx=20, pady=10)
+            card.pack(fill="x", pady=4)
 
             tk.Label(card, text="●", bg=CARD, fg=spec.color, font=(SANS, 24)).pack(
                 side="left", padx=(0, 16)
@@ -493,15 +495,17 @@ class SetupWizard:
                 info,
                 text=spec.display,
                 bg=CARD,
-                fg=WHITE,
+                fg=SIDEBAR,
                 font=(SANS, FONT_SIZE_L, "bold"),
                 anchor="w",
             ).pack(anchor="w")
 
             install_status = " •  installed" if is_installed(key) else ""
             GREEN if is_installed(key) else MUTED
+            vendor_line = tk.Frame(info, bg=CARD)
+            vendor_line.pack(anchor="w")
             sub = tk.Label(
-                info,
+                vendor_line,
                 text=spec.vendor,
                 bg=CARD,
                 fg=MUTED,
@@ -511,7 +515,7 @@ class SetupWizard:
             sub.pack(side="left")
             if install_status:
                 tk.Label(
-                    info,
+                    vendor_line,
                     text=install_status,
                     bg=CARD,
                     fg=GREEN,
@@ -520,12 +524,14 @@ class SetupWizard:
 
             if not spec.npm_pkg:
                 tk.Label(
-                    card,
+                    info,
                     text=spec.note or "Coming Soon",
                     bg=CARD,
                     fg=YELLOW,
                     font=(SANS, FONT_SIZE_BASE, "bold"),
-                ).pack(side="right", padx=10)
+                    wraplength=580,
+                    justify="left",
+                ).pack(anchor="w", pady=(4, 0))
             tk.Checkbutton(
                 card,
                 variable=var,
@@ -709,11 +715,11 @@ class SetupWizard:
             parent,
             bg=CARD,
             padx=22,
-            pady=18,
+            pady=12,
             highlightbackground="#E0E2EE",
             highlightthickness=1,
         )
-        card.pack(fill="x", pady=8)
+        card.pack(fill="x", pady=4)
 
         top = tk.Frame(card, bg=CARD)
         top.pack(fill="x")

@@ -14,6 +14,14 @@ from typing import Any
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _PROJECT_ROOT = str(Path(__file__).parent.parent.absolute())
 
+# Gemini model fallback ladder — tried in order when quota is exhausted
+_GEMINI_MODEL_LADDER = [
+    None,                    # default (no -m flag) = Gemini 2.5 Pro
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+]
+
 _CLI_MAP = {
     "claude": "claude",
     "gemini": "gemini",
@@ -96,6 +104,9 @@ def _build_argv(
             abs_cwd = cwd
             if not os.path.isabs(cwd):
                 abs_cwd = os.path.join("/app/leadagent-data", cwd)
+            # Translate host repo path → container mount point
+            if abs_cwd == _PROJECT_ROOT or abs_cwd.startswith(_PROJECT_ROOT + "/"):
+                abs_cwd = "/app/leadagent-data" + abs_cwd[len(_PROJECT_ROOT):]
             # Host temp paths (macOS /var/folders) aren't mounted in containers.
             _MOUNTED_PREFIXES = ["/app/leadagent-data", os.path.expanduser("~")]
             workspace = os.environ.get("LEADAGENT_WORKSPACE")
@@ -129,11 +140,11 @@ class CLIAgent:
     def __init__(self, command: str):
         self.command = command
 
-    def _build_popen_args(self, prompt: str, cwd: str, mode: str) -> tuple[list[str], str | None, bool]:
+    def _build_popen_args(self, prompt: str, cwd: str, mode: str, gemini_model: str | None = None) -> tuple[list[str], str | None, bool]:
         """Return (args, stdin_data, use_stdin)."""
         use_stdin = len(prompt) > _ARG_MAX
         stdin_data = prompt if use_stdin else None
-        
+
         if self.command == "gemini":
             # Map LeadAgent internal modes to Gemini's --approval-mode values:
             #   "execute" → "yolo"    (auto-approve all, structural rules still enforce)
@@ -141,6 +152,8 @@ class CLIAgent:
             #   anything else → "default"
             gemini_mode = {"execute": "yolo"}.get(mode, "default")
             flags = ["--skip-trust", "--approval-mode", gemini_mode]
+            if gemini_model:
+                flags = ["-m", gemini_model] + flags
             if not use_stdin:
                 flags = ["-p", prompt] + flags
             return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
@@ -186,6 +199,10 @@ class CLIAgent:
             yield from self._execute_jsonl_stream(command_args, prompt if use_stdin else None, cwd)
             return
 
+        if self.command == "gemini":
+            yield from self._execute_gemini_with_fallback(prompt, cwd, mode)
+            return
+
         command_args, stdin_data, use_stdin = self._build_popen_args(prompt, cwd, mode)
         if not command_args:
              raise ValueError(f"Unsupported agent command: {self.command}")
@@ -215,10 +232,22 @@ class CLIAgent:
             for raw_line in process.stdout:
                 line = _ANSI_RE.sub("", raw_line)
                 stripped = line.strip()
-                if stripped and not any(
-                    stripped.startswith(p) for p in _SUPPRESS_PREFIXES
+                if not stripped:
+                    continue
+                if any(stripped.startswith(p) for p in _SUPPRESS_PREFIXES):
+                    continue
+                # Detect quota exhaustion lines from the Gemini CLI (and similar CLIs)
+                # so we can raise AGENT_TRANSIENT_ERROR and trigger a fallback instead
+                # of printing the retry spam to the user.
+                low = stripped.lower()
+                if (
+                    "exhausted your capacity" in low
+                    or "quota will reset" in low
+                    or ("attempt" in low and "failed" in low and "retrying" in low)
                 ):
-                    yield line
+                    process.terminate()
+                    raise Exception("AGENT_TRANSIENT_ERROR")
+                yield line
 
             process.wait()
         finally:
@@ -227,6 +256,65 @@ class CLIAgent:
 
         if process.returncode != 0 and process.returncode != 1:
             raise Exception(f"Agent failed with exit code {process.returncode}")
+
+    def _execute_gemini_with_fallback(
+        self, prompt: str, cwd: str, mode: str
+    ) -> Generator[str, None, None]:
+        """Run Gemini, walking down _GEMINI_MODEL_LADDER on quota exhaustion."""
+        for i, model in enumerate(_GEMINI_MODEL_LADDER):
+            command_args, stdin_data, use_stdin = self._build_popen_args(prompt, cwd, mode, gemini_model=model)
+            env = os.environ.copy()
+            env.setdefault("TERM", "xterm-256color")
+            env.setdefault("COLORTERM", "truecolor")
+            local_cwd = cwd if os.path.isdir(cwd) else None
+            process = subprocess.Popen(
+                command_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if use_stdin else None,
+                text=True,
+                bufsize=0,
+                cwd=local_cwd,
+                env=env,
+                start_new_session=True,
+            )
+            quota_hit = False
+            try:
+                if use_stdin and stdin_data:
+                    process.stdin.write(stdin_data)
+                    process.stdin.close()
+                for raw_line in process.stdout:
+                    line = _ANSI_RE.sub("", raw_line)
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if any(stripped.startswith(p) for p in _SUPPRESS_PREFIXES):
+                        continue
+                    low = stripped.lower()
+                    if (
+                        "exhausted your capacity" in low
+                        or "quota will reset" in low
+                        or ("attempt" in low and "failed" in low and "retrying" in low)
+                    ):
+                        quota_hit = True
+                        process.terminate()
+                        break
+                    yield line
+                if not quota_hit:
+                    process.wait()
+                    return
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+
+            # Quota hit — try next model in ladder
+            next_model = _GEMINI_MODEL_LADDER[i + 1] if i + 1 < len(_GEMINI_MODEL_LADDER) else None
+            if next_model is None and i + 1 >= len(_GEMINI_MODEL_LADDER):
+                raise Exception("AGENT_TRANSIENT_ERROR")
+            label = next_model or "default model"
+            yield f"__STATUS__:Gemini quota exhausted — retrying with {label}...\n"
+
+        raise Exception("AGENT_TRANSIENT_ERROR")
 
     def _execute_jsonl_stream(
         self, command_args: list[str], stdin_data: str | None, cwd: str
@@ -352,7 +440,11 @@ class CLIAgent:
             mcp_path,
         ]
         
-        if mode != "execute":
+        if mode == "execute":
+            # Skip interactive permission prompts in agentic mode — LeadAgent's MCP
+            # rules layer already enforces allow/block/escalate before Claude gets here.
+            stream_flags += ["--dangerously-skip-permissions"]
+        else:
             stream_flags += [
                 "--permission-prompt-tool",
                 "mcp__leadagent_perm__ask_permission",

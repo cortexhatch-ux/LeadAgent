@@ -123,6 +123,11 @@ class AgentRouter:
         ("claude", ErrorType.LOGIC_ERROR): "codex",
         # Default fallbacks
         ("grok", ErrorType.UNKNOWN): "claude",
+        # Quota exhaustion — switch to the next available agent
+        ("gemini", ErrorType.TRANSIENT_CAPACITY): "claude",
+        ("claude", ErrorType.TRANSIENT_CAPACITY): "gemini",
+        ("codex", ErrorType.TRANSIENT_CAPACITY): "claude",
+        ("grok", ErrorType.TRANSIENT_CAPACITY): "claude",
     }
 
     # Which agent is best-suited for which task type.

@@ -94,7 +94,7 @@ AGENTS: dict[str, AgentSpec] = {
         key="ollama",
         display="Ollama (Local)",
         vendor="Ollama",
-        color="#ffffff",
+        color="#64748b",
         note="Local SLM runner. Requires Ollama to be running on port 11434.",
         auth_check=["ollama", "list"],
     ),

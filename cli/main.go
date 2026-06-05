@@ -101,6 +101,7 @@ const (
 var (
 	requestCancel func() = func() {}
 	requestMu     sync.Mutex
+	termMu        sync.Mutex
 )
 
 func setRequestCancel(cancel func()) {
@@ -182,6 +183,9 @@ func printTimingLedger(jsonStr string) {
 		badge = " via " + getAgentColor(ag) + strings.ToUpper(ag) + Reset + Dim + Gray
 	}
 
+	termMu.Lock()
+	defer termMu.Unlock()
+
 	fmt.Printf("\n%s%s┌─ Timing Ledger%s %s%s\n", Dim, Gray, badge, strings.Repeat("─", 28), Reset)
 	sep := Dim + Gray + "│" + Reset
 
@@ -213,6 +217,8 @@ func printTimingLedger(jsonStr string) {
 func printAgentHeader(agent string) {
 	color := getAgentColor(agent)
 	label := strings.ToUpper(agent)
+	termMu.Lock()
+	defer termMu.Unlock()
 	fmt.Printf("\n%s %s●%s %s%s%s\n", Dim+Gray+"───", color, Reset+Dim+Gray+"──────────────────────────────────────────────────────── ", color+Bold, label, Reset)
 }
 
@@ -979,8 +985,10 @@ func getAgentColor(agent string) string {
 		return Bold + Green
 	case "grok":
 		return Bold + Yellow
-	default:
+	case "ollama":
 		return Bold + Cyan
+	default:
+		return Bold + White
 	}
 }
 
@@ -1065,7 +1073,9 @@ func startSpinner(agent string) (stop func(), updateLabel func(string)) {
 		for i := 0; ; i++ {
 			select {
 			case <-done:
+				termMu.Lock()
 				fmt.Printf("\r%-80s\r", "")
+				termMu.Unlock()
 				return
 			default:
 				mu.Lock()
@@ -1074,11 +1084,13 @@ func startSpinner(agent string) (stop func(), updateLabel func(string)) {
 				mu.Unlock()
 
 				elapsed := int(time.Since(start).Seconds())
+				termMu.Lock()
 				fmt.Printf("\r%s%s%s %s%s%s (%ds)",
 					clr, frames[i%len(frames)], Reset,
 					Dim+Gray, lbl, Reset,
 					elapsed,
 				)
+				termMu.Unlock()
 				time.Sleep(80 * time.Millisecond)
 			}
 		}

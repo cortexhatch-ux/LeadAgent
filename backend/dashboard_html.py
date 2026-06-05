@@ -384,7 +384,8 @@ DASHBOARD_HTML = """
                 claude: '#a78cf7',
                 gemini: '#5e9cf5',
                 codex: '#5dba6e',
-                grok: '#e8a840'
+                grok: '#e8a840',
+                ollama: '#64748b'
             };
             return colors[key] || '#64748b';
         }

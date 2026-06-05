@@ -53,7 +53,7 @@ func TestIsProgressLine(t *testing.T) {
 // ── getAgentColor ─────────────────────────────────────────────────────────────
 
 func TestGetAgentColor(t *testing.T) {
-	cases := []string{"claude", "gemini", "codex", "grok", "unknown"}
+	cases := []string{"claude", "gemini", "codex", "grok", "ollama", "unknown"}
 	for _, name := range cases {
 		color := getAgentColor(name)
 		if color == "" {
@@ -136,6 +136,17 @@ func TestPrintTimingLedger_InvalidJSON(t *testing.T) {
 
 func TestPrintTimingLedger_EmptyJSON(t *testing.T) {
 	printTimingLedger("{}")
+}
+
+func TestPrintTimingLedger_FanoutSummary(t *testing.T) {
+	timing := map[string]interface{}{
+		"agents":  []interface{}{"claude"},
+		"memory":  "44ms",
+		"routing": "982ms",
+		"total":   "1.2s",
+	}
+	b, _ := json.Marshal(timing)
+	printTimingLedger(string(b))
 }
 
 // ── statusDot ─────────────────────────────────────────────────────────────────
