@@ -302,6 +302,8 @@ class CLIAgent:
                     yield line
                 if not quota_hit:
                     process.wait()
+                    if process.returncode != 0 and process.returncode != 1:
+                        raise Exception(f"Gemini failed with exit code {process.returncode}")
                     return
             finally:
                 if process.poll() is None:
