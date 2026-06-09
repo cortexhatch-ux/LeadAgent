@@ -105,6 +105,11 @@ sleep 1
 
 export LEADAGENT_TAG=true
 
+# Load environment variables from .env if present
+if [ -f "backend/.env" ]; then
+    export $(grep -v '^#' backend/.env | xargs)
+fi
+
 # Load workspace path from config.json
 CONFIG_FILE="leadagent-data/config.json"
 WORKSPACE="${LEADAGENT_WORKSPACE:-$HOME}"
@@ -212,7 +217,18 @@ if wants backend; then
     if [ "$DAEMON_MODE" = true ]; then
         echo "   Running in background. Logs: leadagent-data/daemon.log"
         nohup env LEADAGENT_TAG=true "$PYTHON" backend/main.py LEADAGENT_TAG=true > leadagent-data/daemon.log 2>&1 &
+        
+        # Start Slack Bot if tokens are present
+        if grep -q "SLACK_BOT_TOKEN=xoxb-" leadagent-data/config.json 2>/dev/null || [ -n "$SLACK_BOT_TOKEN" ]; then
+             echo "🚀 Launching Slack Bot daemon..."
+             nohup env LEADAGENT_TAG=true "$PYTHON" backend/slack_bot.py > leadagent-data/slack_bot.log 2>&1 &
+        fi
     else
+        # In non-daemon mode, we run the bot in the background but keep the backend in foreground
+        if [ -n "$SLACK_BOT_TOKEN" ]; then
+             echo "🚀 Launching Slack Bot daemon..."
+             nohup env LEADAGENT_TAG=true "$PYTHON" backend/slack_bot.py > leadagent-data/slack_bot.log 2>&1 &
+        fi
         exec env LEADAGENT_TAG=true "$PYTHON" backend/main.py LEADAGENT_TAG=true
     fi
 fi

@@ -133,6 +133,10 @@ _SUPPRESS_PREFIXES = (
     "(node:",
     "DeprecationWarning:",
     "[DEP",
+    "┌─",
+    "│",
+    "at ",
+    "[Routing]",
 )
 
 
@@ -215,7 +219,7 @@ class CLIAgent:
         process = subprocess.Popen(
             command_args,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             stdin=subprocess.PIPE if use_stdin else None,
             text=True,
             bufsize=0,
@@ -223,6 +227,13 @@ class CLIAgent:
             env=env,
             start_new_session=True,
         )
+
+        def _log_stderr():
+            for line in process.stderr:
+                if line.strip():
+                    print(f"[{self.command} CLI Stderr]: {line.strip()}")
+
+        threading.Thread(target=_log_stderr, daemon=True).start()
 
         try:
             if use_stdin and stdin_data:
@@ -236,9 +247,7 @@ class CLIAgent:
                     continue
                 if any(stripped.startswith(p) for p in _SUPPRESS_PREFIXES):
                     continue
-                # Detect quota exhaustion lines from the Gemini CLI (and similar CLIs)
-                # so we can raise AGENT_TRANSIENT_ERROR and trigger a fallback instead
-                # of printing the retry spam to the user.
+                # Detect quota exhaustion lines
                 low = stripped.lower()
                 if (
                     "exhausted your capacity" in low
@@ -270,7 +279,7 @@ class CLIAgent:
             process = subprocess.Popen(
                 command_args,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE if use_stdin else None,
                 text=True,
                 bufsize=0,
@@ -278,6 +287,14 @@ class CLIAgent:
                 env=env,
                 start_new_session=True,
             )
+
+            def _log_stderr():
+                for line in process.stderr:
+                    if line.strip():
+                        print(f"[Gemini CLI Stderr]: {line.strip()}")
+
+            threading.Thread(target=_log_stderr, daemon=True).start()
+
             quota_hit = False
             try:
                 if use_stdin and stdin_data:
@@ -442,15 +459,10 @@ class CLIAgent:
             mcp_path,
         ]
         
-        if mode == "execute":
-            # Skip interactive permission prompts in agentic mode — LeadAgent's MCP
-            # rules layer already enforces allow/block/escalate before Claude gets here.
-            stream_flags += ["--dangerously-skip-permissions"]
-        else:
-            stream_flags += [
-                "--permission-prompt-tool",
-                "mcp__leadagent_perm__ask_permission",
-            ]
+        stream_flags += [
+            "--permission-prompt-tool",
+            "mcp__leadagent_perm__ask_permission",
+        ]
 
         if use_stdin:
             command_args = _build_argv("claude", stream_flags)
@@ -560,6 +572,7 @@ class OllamaAgent:
         cwd: str = ".",
         session_id: str = "default",
         simple: bool = False,
+        mode: str = "plan",
     ) -> Generator[str, None, None]:
         try:
             response = requests.post(

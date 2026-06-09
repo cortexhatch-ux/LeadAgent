@@ -150,6 +150,31 @@ services:
     depends_on:
       - backend
 
+  # ── Slack Bot ───────────────────────────────────────────────────────────────
+  slack-bot:
+    build: .
+    container_name: leadagent-slack-bot
+    labels:
+      - "com.leadagent.tag=true"
+    networks:
+      - leadagent-net
+    command: python backend/slack_bot.py
+    volumes:
+      - .:/app/leadagent-data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.claude:/root/.claude
+      - ${HOME}/.gemini:/root/.gemini
+      # Mirror host projects path
+      - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
+    environment:
+      - PYTHONPATH=/app/leadagent-data
+      - LEADAGENT_TAG=true
+      - LEADAGENT_DOCKER_MODE=1
+      - LEADAGENT_WORKSPACE=${LEADAGENT_WORKSPACE}
+    restart: unless-stopped
+    depends_on:
+      - backend
+
   # ── Local SLM (Ollama) ──────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
