@@ -98,6 +98,54 @@ leadagent --onboarding          # re-run setup wizard
 tail -f leadagent-data/daemon.log
 ```
 
+## Slack Bot (Optional)
+
+LeadAgent ships an optional Slack bot that brings `/debate` and `@LeadAgent` mention support directly into your workspace. It is a standalone process — the main backend runs fine without it.
+
+### 1. Create a Slack App
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch**
+2. Under **OAuth & Permissions** → **Scopes** → **Bot Token Scopes**, add:
+   - `chat:write`
+   - `commands`
+   - `app_mentions:read`
+3. Under **Socket Mode**, enable Socket Mode and generate an **App-Level Token** with scope `connections:write` — this becomes `SLACK_APP_TOKEN`
+4. Under **Slash Commands**, create `/debate` pointing to your app
+5. Under **Event Subscriptions** → **Subscribe to bot events**, add `app_mention`
+6. Install the app to your workspace — copy the **Bot User OAuth Token** (`xoxb-...`) as `SLACK_BOT_TOKEN`
+
+### 2. Configure
+
+Add to `backend/.env` (or export in your shell):
+
+```env
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+```
+
+### 3. Run
+
+```bash
+python3 -m backend.slack_bot
+```
+
+Or alongside the backend:
+
+```bash
+./start_backend.sh --daemon
+python3 -m backend.slack_bot
+```
+
+### Usage
+
+| Trigger | What it does |
+|---|---|
+| `/debate Should we use React or Vue?` | Starts a 3-round multi-agent debate, posts each agent's position as a thread reply |
+| `@LeadAgent debate <topic>` | Same as above via mention |
+| `@LeadAgent <anything else>` | Returns a usage hint |
+
+Debate results stream into the channel in real time — each agent's position and the umpire question appear as thread replies, with a final synthesis posted at the end.
+
 ## Contributing
 
 Open engineering surfaces:
