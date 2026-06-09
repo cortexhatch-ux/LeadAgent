@@ -15,9 +15,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterator
 
 from backend.agents import agent_factory
-from backend.agents_catalog import enabled_agents
+from backend.agents_catalog import enabled_agents, AGENT_ORDER
 from backend.db import db
 from backend.memory_client import memory_client
+from backend.router import agent_router
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -27,6 +28,8 @@ will argue about the following topic across {rounds} rounds.
 
 Topic:
 {prompt}
+
+{context}
 
 Give your honest, thorough assessment. Take clear positions — hedging is \
 unhelpful here. Be specific: cite real risks, real opportunities, concrete examples.
@@ -39,6 +42,8 @@ You are an impartial debate moderator. You have NO stake in the outcome and take
 
 The topic under debate:
 {prompt}
+
+{context}
 
 Here is what has been argued so far (anonymised — you don't know who said what):
 {anonymous_positions}
@@ -60,6 +65,8 @@ This is round {round} of {rounds} in a structured multi-agent debate.
 
 Original topic:
 {prompt}
+
+{context}
 
 The other agents argued in the previous round:
 {other_positions}
@@ -128,11 +135,12 @@ def _anonymise_round(round_resps: list[str]) -> str:
     return "\n---\n".join([f"Position: {r}" for r in round_resps])
 
 
-def _run_sync(agent_name: str, prompt: str, cwd: str) -> str:
+def _run_sync(agent_name: str, prompt: str, cwd: str, mode: str = "plan") -> str:
     agent = agent_factory.get_agent(agent_name)
     chunks = []
     # session_id=debate avoids cluttering main context cache
-    for chunk in agent.execute_stream(prompt, cwd, session_id="debate", simple=True):
+    # simple=False enables tool access for agents that support it (e.g. Claude via MCP)
+    for chunk in agent.execute_stream(prompt, cwd, session_id="debate", simple=False, mode=mode):
         chunks.append(chunk)
     return "".join(chunks)
 
@@ -143,7 +151,9 @@ def _run_sync(agent_name: str, prompt: str, cwd: str) -> str:
 def run_debate(
     prompt: str, rounds: int = 3, cwd: str = ".", agents: list[str] = None
 ) -> Iterator[str]:
-    all_available = list(enabled_agents())
+    enabled = enabled_agents()
+    all_available = [a for a in AGENT_ORDER if a in enabled]
+
     if agents:
         active_debaters = [a for a in agents if a in all_available]
     else:
@@ -153,6 +163,21 @@ def run_debate(
     if not active_debaters:
         yield "Error: No agents available for debate.\n"
         return
+
+    # ── Context Injection ──
+    # Fetch relevant project knowledge, past Q&A, and file structures
+    # session_id="debate" ensures we don't pollute the user's regular chat cache
+    raw_context = agent_router.check_memory(prompt, session_id="debate")
+    injected_context = ""
+    if raw_context:
+        injected_context = (
+            "=== PROJECT CONTEXT (Found in Knowledge Graph) ===\n"
+            f"{raw_context}\n"
+            "=== END PROJECT CONTEXT ===\n"
+        )
+    
+    # Use 'execute' mode so agents can use tools autonomously if needed
+    mode = "plan"
 
     history: list[list[str]] = []
     umpire_questions: list[str] = []
@@ -164,7 +189,11 @@ def run_debate(
         prompts: dict[str, str] = {}
         for agent_name in active_debaters:
             if r == 1:
-                prompts[agent_name] = _ROUND1.format(rounds=rounds, prompt=prompt)
+                prompts[agent_name] = _ROUND1.format(
+                    rounds=rounds, 
+                    prompt=prompt, 
+                    context=injected_context
+                )
             else:
                 other_positions = []
                 for idx, other_name in enumerate(active_debaters):
@@ -176,6 +205,7 @@ def run_debate(
                     round=r,
                     rounds=rounds,
                     prompt=prompt,
+                    context=injected_context,
                     other_positions="\n\n".join(other_positions),
                     umpire_question=umpire_questions[-1],
                 )
@@ -184,7 +214,7 @@ def run_debate(
         responses: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=len(active_debaters)) as pool:
             futures = {
-                pool.submit(_run_sync, name, prompts[name], cwd): name
+                pool.submit(_run_sync, name, prompts[name], cwd, mode): name
                 for name in active_debaters
             }
             for fut in as_completed(futures):
@@ -216,9 +246,13 @@ def run_debate(
             )
 
             anon = _anonymise_round(round_responses)
-            umpire_prompt = _UMPIRE.format(prompt=prompt, anonymous_positions=anon)
+            umpire_prompt = _UMPIRE.format(
+                prompt=prompt, 
+                context=injected_context,
+                anonymous_positions=anon
+            )
             try:
-                question = _run_sync(umpire_agent, umpire_prompt, cwd)
+                question = _run_sync(umpire_agent, umpire_prompt, cwd, mode)
             except Exception:
                 question = "What fundamental assumption in this debate hasn't been challenged yet?"
 
@@ -239,7 +273,7 @@ def run_debate(
     synth_responses: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=len(active_debaters)) as pool:
         futures = {
-            pool.submit(_run_sync, name, synth_prompts[name], cwd): name
+            pool.submit(_run_sync, name, synth_prompts[name], cwd, mode): name
             for name in active_debaters
         }
         for fut in as_completed(futures):

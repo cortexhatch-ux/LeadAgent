@@ -60,20 +60,6 @@ class TestRoles:
         assert "general" in resp.json()
 
 
-# ── GET /quotas ───────────────────────────────────────────────────────────────
-
-class TestQuotas:
-    def test_returns_agent_quotas(self, client):
-        resp = client.get("/quotas")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "claude" in data
-
-    def test_quota_has_exhausted_field(self, client):
-        resp = client.get("/quotas")
-        assert "exhausted" in resp.json()["claude"]
-
-
 # ── POST /permission/_request ─────────────────────────────────────────────────
 
 class TestPermissionRequest:
@@ -161,19 +147,6 @@ class TestPermissionWait:
         assert resp.json()["behavior"] == "allow"
 
 
-# ── POST /quota/exhaust ───────────────────────────────────────────────────────
-
-class TestQuotaExhaust:
-    def test_marks_agent_exhausted(self, client):
-        resp = client.post("/quota/exhaust?agent=claude&exhausted=true")
-        assert resp.status_code == 200
-
-    def test_clears_exhaustion(self, client):
-        client.post("/quota/exhaust?agent=claude&exhausted=true")
-        resp = client.post("/quota/exhaust?agent=claude&exhausted=false")
-        assert resp.status_code == 200
-
-
 # ── POST /session/clear ───────────────────────────────────────────────────────
 
 class TestSessionClear:
@@ -186,8 +159,11 @@ class TestSessionClear:
 # ── POST /chat ────────────────────────────────────────────────────────────────
 
 class TestChat:
-    def _mock_routing(self, agent_name="claude"):
-        return patch("backend.main.agent_router.route", return_value=agent_name)
+    def _mock_route_multi(self, agent_name="claude", mode="plan"):
+        return patch(
+            "backend.main.agent_router.route_multi",
+            return_value=([agent_name], {"mode": mode}),
+        )
 
     def _mock_memory(self):
         return patch("backend.main.agent_router.check_memory", return_value=None)
@@ -200,7 +176,7 @@ class TestChat:
     def test_returns_streaming_response(self, client):
         with (
             self._mock_memory(),
-            self._mock_routing(),
+            self._mock_route_multi(),
             self._mock_agent(["Hello world\n"]),
             patch("backend.main.memory_client.store"),
             patch("backend.main.agent_router.learn_from_prompt"),
@@ -209,19 +185,20 @@ class TestChat:
         assert resp.status_code == 200
         assert "Hello world" in resp.text
 
-    def test_503_when_no_agents_available(self, client):
+    def test_no_agents_streams_error_message(self, client):
+        # When no agents are available the endpoint streams a 200 with an error message
         with (
             self._mock_memory(),
-            patch("backend.main.agent_router.route", return_value="none"),
-            patch("backend.main.quota_manager.get_wait_status", return_value="All exhausted"),
+            patch("backend.main.agent_router.route_multi", return_value=(["none"], {})),
         ):
             resp = client.post("/chat", json={"prompt": "hi", "session_id": "s1"})
-        assert resp.status_code == 503
+        assert resp.status_code == 200
+        assert "No agents available" in resp.text
 
     def test_includes_timing_in_response(self, client):
         with (
             self._mock_memory(),
-            self._mock_routing(),
+            self._mock_route_multi(),
             self._mock_agent(["response chunk\n"]),
             patch("backend.main.memory_client.store"),
             patch("backend.main.agent_router.learn_from_prompt"),
@@ -229,44 +206,22 @@ class TestChat:
             resp = client.post("/chat", json={"prompt": "hi", "session_id": "s1"})
         assert "__TIMING__:" in resp.text
 
-    def test_permission_request_injected_into_stream(self, client, fresh_broker):
-        import threading, time
-
-        chunks_sent = []
-
-        def _fake_stream(*args, **kwargs):
-            # Simulate the agent pausing while a permission request is pending
-            time.sleep(0.05)
-            yield "agent response\n"
-
-        mock_agent = MagicMock()
-        mock_agent.execute_stream.side_effect = _fake_stream
-
-        def _inject_perm():
-            time.sleep(0.02)
-            fresh_broker.create("s1", "claude", "Bash", {"command": "ls"})
-            # Auto-decide so the stream doesn't hang
-            prs = list(fresh_broker._pending.values())
-            for pr in prs:
-                fresh_broker.decide(pr.id, "allow")
-
-        threading.Thread(target=_inject_perm, daemon=True).start()
-
+    def test_status_markers_in_response(self, client):
         with (
             self._mock_memory(),
-            self._mock_routing(),
-            patch("backend.main.agent_factory.get_agent", return_value=mock_agent),
+            self._mock_route_multi(),
+            self._mock_agent(["ok\n"]),
             patch("backend.main.memory_client.store"),
             patch("backend.main.agent_router.learn_from_prompt"),
         ):
             resp = client.post("/chat", json={"prompt": "hi", "session_id": "s1"})
-
-        assert "__PERMISSION_REQUEST__:" in resp.text
+        assert "__STATUS__:" in resp.text
 
     def test_warning_shown_when_preferred_agent_unavailable(self, client):
+        # route_multi returns gemini but user asked for claude → warning emitted
         with (
             self._mock_memory(),
-            patch("backend.main.agent_router.route", return_value="gemini"),
+            self._mock_route_multi(agent_name="gemini"),
             self._mock_agent(["ok\n"]),
             patch("backend.main.memory_client.store"),
             patch("backend.main.agent_router.learn_from_prompt"),
@@ -275,3 +230,31 @@ class TestChat:
                 "prompt": "hi", "session_id": "s1", "preferred_agent": "claude",
             })
         assert "unavailable" in resp.text
+
+    def test_permission_request_injected_into_stream(self, client, fresh_broker):
+        import threading, time
+
+        def _fake_stream(*args, **kwargs):
+            time.sleep(0.05)
+            yield "agent response\n"
+
+        mock_agent = MagicMock()
+        mock_agent.execute_stream.side_effect = _fake_stream
+
+        def _inject_perm():
+            time.sleep(0.02)
+            pr = fresh_broker.create("s1", "claude", "Bash", {"command": "ls"})
+            fresh_broker.decide(pr.id, "allow")
+
+        threading.Thread(target=_inject_perm, daemon=True).start()
+
+        with (
+            self._mock_memory(),
+            self._mock_route_multi(),
+            patch("backend.main.agent_factory.get_agent", return_value=mock_agent),
+            patch("backend.main.memory_client.store"),
+            patch("backend.main.agent_router.learn_from_prompt"),
+        ):
+            resp = client.post("/chat", json={"prompt": "hi", "session_id": "s1"})
+
+        assert "__PERMISSION_REQUEST__:" in resp.text

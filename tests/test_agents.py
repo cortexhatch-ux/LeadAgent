@@ -78,12 +78,27 @@ class TestExecuteStreamNonClaude:
         assert any("Green text" in c for c in chunks)
         assert not any("\x1b" in c for c in chunks)
 
-    def test_nonzero_returncode_raises_quota_exhausted(self):
-        agent = CLIAgent("gemini")
+    def test_nonzero_returncode_raises(self):
+        # returncode=1 is allowed; returncode=2 (unexpected) should raise for grok (standard path)
+        agent = CLIAgent("grok")
+        proc = self._fake_process([], returncode=2)
+        with patch("subprocess.Popen", return_value=proc):
+            with pytest.raises(Exception):
+                list(agent.execute_stream("hi", session_id="s1"))
+
+    def test_returncode_one_does_not_raise(self):
+        # returncode=1 is explicitly tolerated on the standard path
+        agent = CLIAgent("grok")
         proc = self._fake_process([], returncode=1)
         with patch("subprocess.Popen", return_value=proc):
-            with pytest.raises(Exception, match="AGENT_QUOTA_EXHAUSTED"):
-                list(agent.execute_stream("hi", session_id="s1"))
+            list(agent.execute_stream("hi", session_id="s1"))
+
+    def test_codex_returncode_not_checked(self):
+        # codex uses _execute_jsonl_stream which has no returncode check
+        agent = CLIAgent("codex")
+        proc = self._fake_process([], returncode=2)
+        with patch("subprocess.Popen", return_value=proc):
+            list(agent.execute_stream("hi", session_id="s1"))  # no exception
 
     def test_zero_returncode_no_exception(self):
         agent = CLIAgent("gemini")
@@ -167,7 +182,25 @@ class TestExecuteClaudeStream:
             chunks = list(agent.execute_stream("hello", session_id="s1"))
         assert chunks == []  # no text content emitted
 
-    def test_result_error_with_quota_signal_raises(self):
+    def test_result_error_with_rate_limit_raises_transient(self):
+        # "rate limit" in the error message triggers AGENT_TRANSIENT_ERROR
+        agent = CLIAgent("claude")
+        events = [
+            {"type": "result", "subtype": "error", "result": "You have hit a rate limit."},
+        ]
+        proc = self._fake_claude_process(events)
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch("tempfile.NamedTemporaryFile") as mock_tmp,
+            patch("os.unlink"),
+        ):
+            mock_tmp.return_value.__enter__.return_value.name = "/tmp/fake.json"
+            mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
+            with pytest.raises(Exception, match="AGENT_TRANSIENT_ERROR"):
+                list(agent.execute_stream("hello", session_id="s1"))
+
+    def test_result_error_non_quota_raises_agent_error(self):
+        # Non-quota errors raise a generic Agent error, not AGENT_TRANSIENT_ERROR
         agent = CLIAgent("claude")
         events = [
             {"type": "result", "subtype": "error", "result": "You've hit your usage limit."},
@@ -180,7 +213,7 @@ class TestExecuteClaudeStream:
         ):
             mock_tmp.return_value.__enter__.return_value.name = "/tmp/fake.json"
             mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
-            with pytest.raises(Exception, match="AGENT_QUOTA_EXHAUSTED"):
+            with pytest.raises(Exception, match="Agent error"):
                 list(agent.execute_stream("hello", session_id="s1"))
 
     def test_mcp_config_written_with_session_id(self):

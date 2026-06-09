@@ -12,6 +12,9 @@ from typing import List, Optional
 import uvicorn
 import json
 import asyncio
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from backend.models import Entity, Relationship, ErrorType
 from backend.db import db
