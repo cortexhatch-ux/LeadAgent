@@ -390,8 +390,10 @@ class GraphDB:
     # ── read methods ─────────────────────────────────────────────────────────
 
     def query(self, cypher: str, params: dict = None):
-        """Returns a raw cursor. Only use when no background thread can write concurrently."""
-        return self.connection.execute(cypher, params or {})
+        """Returns a raw cursor. Holds the lock during execute to avoid racing
+        the janitor / learning threads that write concurrently."""
+        with self._lock:
+            return self.connection.execute(cypher, params or {})
 
     def query_all(self, cypher: str, params: dict = None) -> list:
         """Thread-safe read: acquires lock, executes, returns all rows as a list."""

@@ -6,7 +6,42 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from backend.agents import CLIAgent, AgentFactory, agent_factory, _PROJECT_ROOT
+from backend.agents import (
+    CLIAgent,
+    AgentFactory,
+    agent_factory,
+    _PROJECT_ROOT,
+    _safe_cwd,
+)
+
+
+# ── _safe_cwd ─────────────────────────────────────────────────────────────────
+
+class TestSafeCwd:
+    def test_project_root_allowed(self):
+        assert _safe_cwd(_PROJECT_ROOT) == os.path.realpath(_PROJECT_ROOT)
+
+    def test_subdir_of_project_allowed(self):
+        sub = os.path.join(_PROJECT_ROOT, "backend")
+        assert _safe_cwd(sub) == os.path.realpath(sub)
+
+    def test_home_allowed(self):
+        home = os.path.expanduser("~")
+        assert _safe_cwd(home) == os.path.realpath(home)
+
+    def test_system_dir_rejected(self):
+        # /etc exists but is outside every allowed root
+        assert _safe_cwd("/etc") is None
+
+    def test_nonexistent_dir_rejected(self):
+        assert _safe_cwd("/nonexistent/path/xyz") is None
+
+    def test_empty_falls_back_to_none(self):
+        assert _safe_cwd("") is None
+
+    def test_extra_root_via_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("LEADAGENT_ALLOWED_CWD", str(tmp_path))
+        assert _safe_cwd(str(tmp_path)) == os.path.realpath(str(tmp_path))
 
 
 # ── _PROJECT_ROOT ─────────────────────────────────────────────────────────────

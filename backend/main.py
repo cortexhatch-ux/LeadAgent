@@ -1,3 +1,4 @@
+import os
 import queue as _queue
 import shutil
 import socket
@@ -31,6 +32,11 @@ from backend.permissions import broker
 _START_TIME = _time.time()
 
 app = FastAPI(title="LeadAgent Daemon")
+
+from backend.security import GuardMiddleware
+
+# Reject LAN peers and cross-origin browser requests (CSRF / DNS rebinding).
+app.add_middleware(GuardMiddleware)
 
 
 @app.on_event("startup")
@@ -553,7 +559,10 @@ def _stream_agent(
             if t_first_box[0] is None:
                 t_first_box[0] = _time.perf_counter()
 
-            response_chunks.append(chunk)
+            # Status markers (tool activity, fallback notices) are UI-only —
+            # keep them out of the stored answer and memory.
+            if not chunk.startswith("__STATUS__:"):
+                response_chunks.append(chunk)
             yield chunk
 
     t4 = _time.perf_counter()
@@ -819,10 +828,16 @@ async def get_graph_d3():
 
 @app.post("/memory/query")
 async def query_memory(query: dict):
+    from backend.security import assert_read_only_cypher, UnsafeCypherError
+
+    cypher = query.get("cypher")
+    if not cypher:
+        raise HTTPException(status_code=400, detail="Missing 'cypher' field")
     try:
-        cypher = query.get("cypher")
-        if not cypher:
-            raise HTTPException(status_code=400, detail="Missing 'cypher' field")
+        assert_read_only_cypher(cypher)
+    except UnsafeCypherError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    try:
         return {"result": db.query_all(cypher)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -905,4 +920,10 @@ async def evaluate_rule(body: RuleEvaluateRequest):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Default to loopback so the daemon is not reachable from the LAN.
+    # In Docker mode the backend must listen on all interfaces so sibling
+    # containers can reach it; the published port should still be bound to
+    # 127.0.0.1 on the host (see docker-compose.yml).
+    default_host = "0.0.0.0" if os.environ.get("LEADAGENT_DOCKER_MODE") else "127.0.0.1"
+    bind_host = os.environ.get("LEADAGENT_BIND_HOST", default_host)
+    uvicorn.run(app, host=bind_host, port=8000)

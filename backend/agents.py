@@ -120,6 +120,57 @@ def _build_argv(
     return [cli] + args
 
 
+def _allowed_cwd_roots() -> list[str]:
+    """Directories an agent is permitted to run inside."""
+    roots = [
+        _PROJECT_ROOT,
+        os.path.expanduser("~"),
+        tempfile.gettempdir(),
+        "/app/leadagent-data",
+    ]
+    workspace = os.environ.get("LEADAGENT_WORKSPACE")
+    if workspace:
+        roots.append(workspace)
+    extra = os.environ.get("LEADAGENT_ALLOWED_CWD", "")
+    roots.extend(p for p in extra.split(":") if p)
+    return [os.path.realpath(r) for r in roots]
+
+
+def _tool_status_hint(tool_input: Any) -> str:
+    """Short human-readable hint for a tool_use event (file path, command, …)."""
+    if isinstance(tool_input, dict):
+        for key in ("file_path", "path", "command", "pattern", "url", "query"):
+            val = tool_input.get(key)
+            if isinstance(val, str) and val:
+                if len(val) > 60:
+                    val = val[:57] + "..."
+                return f"({val})"
+    return ""
+
+
+def _safe_cwd(cwd: str) -> str | None:
+    """Resolve `cwd` and return it only if it sits inside an allowed root.
+
+    Caller-supplied working directories flow straight into subprocess spawns,
+    so an unchecked absolute/`..` path could point an agent at any directory on
+    the host. Anything outside the allow-list falls back to None (the daemon's
+    own cwd) instead of being honored.
+    """
+    if not cwd:
+        return None
+    try:
+        resolved = os.path.realpath(cwd)
+    except (OSError, ValueError):
+        return None
+    if not os.path.isdir(resolved):
+        return None
+    for root in _allowed_cwd_roots():
+        if resolved == root or resolved.startswith(root + os.sep):
+            return resolved
+    print(f"[security] rejected cwd outside allowed roots: {cwd}")
+    return None
+
+
 # Prompts larger than this are passed via stdin to avoid OS ARG_MAX limits
 _ARG_MAX = 100_000
 
@@ -195,7 +246,19 @@ class CLIAgent:
             return
 
         if self.command == "codex":
-            flags = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
+            # By default run Codex in a workspace-scoped sandbox with no
+            # interactive approvals — it can edit files in its cwd but cannot
+            # touch the wider host or network. The fully-unsandboxed mode
+            # (host + network access, no approvals) is opt-in because, combined
+            # with prompt injection, it is a host-takeover primitive.
+            if os.environ.get("LEADAGENT_ALLOW_UNSANDBOXED"):
+                flags = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
+            else:
+                flags = [
+                    "exec", "--json",
+                    "--sandbox", "workspace-write",
+                    "--ask-for-approval", "never",
+                ]
             use_stdin = len(prompt) > _ARG_MAX
             if not use_stdin:
                 flags.append(prompt)
@@ -215,7 +278,7 @@ class CLIAgent:
         env.setdefault("TERM", "xterm-256color")
         env.setdefault("COLORTERM", "truecolor")
 
-        local_cwd = cwd if os.path.isdir(cwd) else None
+        local_cwd = _safe_cwd(cwd)
         process = subprocess.Popen(
             command_args,
             stdout=subprocess.PIPE,
@@ -275,7 +338,7 @@ class CLIAgent:
             env = os.environ.copy()
             env.setdefault("TERM", "xterm-256color")
             env.setdefault("COLORTERM", "truecolor")
-            local_cwd = cwd if os.path.isdir(cwd) else None
+            local_cwd = _safe_cwd(cwd)
             process = subprocess.Popen(
                 command_args,
                 stdout=subprocess.PIPE,
@@ -363,7 +426,7 @@ class CLIAgent:
         env.setdefault("TERM", "xterm-256color")
         env.setdefault("COLORTERM", "truecolor")
 
-        local_cwd = cwd if os.path.isdir(cwd) else None
+        local_cwd = _safe_cwd(cwd)
         # Only pipe stdin if we actually have data to send.
         # Otherwise, some CLIs (like codex) might hang waiting for input.
         process = subprocess.Popen(
@@ -457,25 +520,37 @@ class CLIAgent:
             "--verbose",
             "--mcp-config",
             mcp_path,
+            # Only load LeadAgent's MCP servers — without this, claude also
+            # loads the user's personal connectors (Gmail, Drive, …) from the
+            # mounted ~/.claude config, exposing them to a headless agent.
+            "--strict-mcp-config",
         ]
-        
+
+        # Map LeadAgent internal modes to claude's --permission-mode:
+        #   "execute" → "acceptEdits" (file edits auto-approved; other tools
+        #               still route through the leadagent_perm prompt tool)
+        #   "plan"    → "default"     (LeadAgent "plan" = ask before acting —
+        #               every tool call asks via the MCP prompt tool)
+        claude_mode = {"execute": "acceptEdits"}.get(mode, "default")
+        stream_flags += ["--permission-mode", claude_mode]
+
         stream_flags += [
             "--permission-prompt-tool",
             "mcp__leadagent_perm__ask_permission",
         ]
 
         if use_stdin:
-            command_args = _build_argv("claude", stream_flags)
+            command_args = _build_argv("claude", stream_flags, cwd=cwd)
             stdin_data: str | None = prompt
         else:
-            command_args = _build_argv("claude", ["-p", prompt] + stream_flags)
+            command_args = _build_argv("claude", ["-p", prompt] + stream_flags, cwd=cwd)
             stdin_data = None
 
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
         env.setdefault("COLORTERM", "truecolor")
 
-        local_cwd = cwd if os.path.isdir(cwd) else None
+        local_cwd = _safe_cwd(cwd)
         process = subprocess.Popen(
             command_args,
             stdout=subprocess.PIPE,
@@ -488,13 +563,18 @@ class CLIAgent:
             start_new_session=True,
         )
 
+        stderr_tail: list[str] = []
+
         def _log_stderr():
             for line in process.stderr:
                 if line.strip():
                     print(f"[Claude CLI Stderr]: {line.strip()}")
+                    stderr_tail.append(line.strip())
+                    del stderr_tail[:-20]
 
         threading.Thread(target=_log_stderr, daemon=True).start()
 
+        saw_result = False
         try:
             if use_stdin and stdin_data:
                 process.stdin.write(stdin_data)
@@ -517,10 +597,16 @@ class CLIAgent:
                 if etype == "assistant":
                     # Full or partial assistant message
                     for item in event.get("message", {}).get("content", []):
-                        if isinstance(item, dict) and item.get("type") == "text":
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "text":
                             text = item.get("text", "")
                             if text:
                                 yield text
+                        elif item.get("type") == "tool_use":
+                            name = item.get("name", "tool")
+                            hint = _tool_status_hint(item.get("input"))
+                            yield f"__STATUS__:claude → {name}{hint}\n"
                 elif etype == "content_block_delta":
                     # Streaming token delta
                     delta = event.get("delta", {})
@@ -528,12 +614,24 @@ class CLIAgent:
                         text = delta.get("text", "")
                         if text:
                             yield text
-                elif etype == "result" and event.get("subtype") == "error":
-                    err = str(event.get("result", "")).lower()
-                    print(f"[Claude CLI Error]: {err}")
-                    if "rate limit" in err or "overloaded" in err or "529" in err:
-                        raise Exception("AGENT_TRANSIENT_ERROR")
-                    raise Exception(f"Agent error: {err}")
+                elif etype == "result":
+                    saw_result = True
+                    subtype = event.get("subtype", "")
+                    # The CLI emits several error subtypes (error,
+                    # error_during_execution, error_max_turns, …) — treat
+                    # anything that isn't an explicit success as a failure.
+                    if event.get("is_error") or subtype != "success":
+                        err = str(
+                            event.get("result") or event.get("error") or subtype
+                        )
+                        detail = f"{subtype}: {err}" if subtype and subtype != err else err
+                        if stderr_tail:
+                            detail += " | stderr: " + " / ".join(stderr_tail[-5:])
+                        print(f"[Claude CLI Error]: {detail}")
+                        low = detail.lower()
+                        if "rate limit" in low or "overloaded" in low or "529" in low:
+                            raise Exception("AGENT_TRANSIENT_ERROR")
+                        raise Exception(f"Agent error: {detail}")
 
         except Exception as e:
             if str(e) != "AGENT_TRANSIENT_ERROR":
@@ -549,12 +647,18 @@ class CLIAgent:
                 except OSError:
                     pass
 
-        if process.returncode not in (0, None, 1):
-            # Read any remaining stderr
-            err_out = process.stderr.read().strip()
-            raise Exception(
-                f"Agent failed with exit code {process.returncode}. Stderr: {err_out}"
-            )
+        # Exit code 1 is only acceptable when the CLI delivered a result event;
+        # a bare exit 1 with no result is a crash that used to die silently.
+        if process.returncode not in (0, None) and not (
+            process.returncode == 1 and saw_result
+        ):
+            detail = f"Agent failed with exit code {process.returncode}"
+            if stderr_tail:
+                detail += ". Stderr: " + " / ".join(stderr_tail[-5:])
+            low = detail.lower()
+            if "rate limit" in low or "overloaded" in low or "529" in low:
+                raise Exception("AGENT_TRANSIENT_ERROR")
+            raise Exception(detail)
 
 
 import requests

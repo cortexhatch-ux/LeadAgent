@@ -1,4 +1,5 @@
 from backend.db import db
+from backend.security import assert_read_only_cypher
 
 
 def add_memory_entity(name: str, type: str, description: str = "") -> str:
@@ -12,4 +13,5 @@ def add_memory_relationship(source: str, target: str, rel_type: str) -> str:
 
 
 def query_memory_graph(cypher: str) -> list:
+    assert_read_only_cypher(cypher)
     return db.query_all(cypher)

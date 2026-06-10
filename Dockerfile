@@ -1,8 +1,15 @@
-FROM python:3.13-slim
+# Pinned base — floating tags can break a working build with no code change
+FROM python:3.13.13-slim
 
-# docker CLI — backend uses it to exec into agent containers
-RUN apt-get update && apt-get install -y curl docker.io && \
-    rm -rf /var/lib/apt/lists/*
+# curl is needed at runtime by the compose healthcheck.
+# Install only the static docker CLI binary — the docker.io package ships the
+# entire engine/daemon, which this image never runs.
+# This container keeps root: it drives the host Docker socket to exec into
+# agent containers, which requires it.
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL "https://download.docker.com/linux/static/stable/$(uname -m)/docker-29.5.3.tgz" \
+    | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
 
 WORKDIR /app/leadagent-data
 

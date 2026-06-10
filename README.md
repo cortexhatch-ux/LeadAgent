@@ -57,9 +57,21 @@ leadagent debate "Microservices vs Monolith for this MVP?"
 Run the full stack in isolation without committing to a native daemon:
 
 ```bash
-docker compose up -d --build
+./start_backend.sh --daemon
 leadagent health
 ```
+
+> **Don't run `docker compose up` directly.** The compose file mirrors your
+> projects workspace into every container via `LEADAGENT_WORKSPACE`, which
+> `start_backend.sh` exports from `leadagent-data/config.json` (set during
+> onboarding). A raw `docker compose up` from a shell without that variable
+> silently mounts `/tmp` instead — agents will no longer see your projects.
+> If you must use compose directly, export the variable first:
+>
+> ```bash
+> export LEADAGENT_WORKSPACE="$(grep -o '"projects_dir": "[^"]*' leadagent-data/config.json | cut -d'"' -f4)"
+> docker compose up -d --build
+> ```
 
 ## Why LeadAgent?
 
