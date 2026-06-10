@@ -1,12 +1,36 @@
+# VCS / IDE
+.git/
+.idea/
+*.iml
+
+# Claude Code workspace — worktrees contain full repo copies
+.claude/
+
+# Runtime data (Ollama models, KuzuDB, …) — multiple GB, bind-mounted at
+# runtime, must never enter the build context
+leadagent-data/
+data/
+
+# Go CLI — built natively on the host, not in any image
+cli/
+
+# Scratch / junk
+junk/
+tmp*.json
+*.jpg
+*.png
+*.log
+.DS_Store
+
+# Python
 venv/
 __pycache__/
 *.pyc
 *.pyo
-data/
-.idea/
-cli/
+.pytest_cache/
+
+# Docs / misc
 *.md
-*.iml
 *.plist
 *.sh
 .env

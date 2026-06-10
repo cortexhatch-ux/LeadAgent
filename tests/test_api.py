@@ -12,7 +12,9 @@ from backend.permissions import PermissionBroker
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    # base_url must be a loopback host so GuardMiddleware admits the request
+    # (TestClient otherwise sends Host: testserver).
+    return TestClient(app, base_url="http://localhost:8000")
 
 
 @pytest.fixture
@@ -21,6 +23,56 @@ def fresh_broker(monkeypatch):
     b = PermissionBroker()
     monkeypatch.setattr("backend.main.broker", b)
     return b
+
+
+# ── GuardMiddleware (Host / Origin) ───────────────────────────────────────────
+
+class TestGuardMiddleware:
+    def test_loopback_host_allowed(self, client):
+        resp = client.get("/")
+        assert resp.status_code == 200
+
+    def test_lan_host_rejected(self, client):
+        resp = client.get("/", headers={"host": "192.168.1.50:8000"})
+        assert resp.status_code == 421
+
+    def test_rebinding_hostname_rejected(self, client):
+        resp = client.get("/", headers={"host": "evil.example.com"})
+        assert resp.status_code == 421
+
+    def test_cross_origin_rejected(self, client):
+        resp = client.get("/", headers={"origin": "https://evil.example.com"})
+        assert resp.status_code == 403
+
+    def test_loopback_origin_allowed(self, client):
+        resp = client.get("/", headers={"origin": "http://localhost:8000"})
+        assert resp.status_code == 200
+
+
+# ── POST /memory/query (read-only guard) ──────────────────────────────────────
+
+class TestMemoryQueryGuard:
+    def test_read_query_allowed(self, client):
+        with patch("backend.main.db.query_all", return_value=[["ok"]]):
+            resp = client.post("/memory/query", json={"cypher": "MATCH (n) RETURN n"})
+        assert resp.status_code == 200
+        assert resp.json()["result"] == [["ok"]]
+
+    def test_delete_query_rejected(self, client):
+        with patch("backend.main.db.query_all") as q:
+            resp = client.post(
+                "/memory/query", json={"cypher": "MATCH (n) DETACH DELETE n"}
+            )
+        assert resp.status_code == 403
+        q.assert_not_called()
+
+    def test_create_query_rejected(self, client):
+        resp = client.post("/memory/query", json={"cypher": "CREATE (n:Evil)"})
+        assert resp.status_code == 403
+
+    def test_missing_cypher_returns_400(self, client):
+        resp = client.post("/memory/query", json={})
+        assert resp.status_code == 400
 
 
 # ── GET / ─────────────────────────────────────────────────────────────────────

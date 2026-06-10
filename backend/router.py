@@ -37,7 +37,11 @@ _EXECUTE_PATTERN = re.compile(
     r"|\b(push|commit|branch|checkout|merge|rebase|pull request|PR|open a PR|create a PR|create.*branch|git)\b"
     r"|\b(run|execute|install|build|deploy|start|stop|restart|test|lint|format|compile)\b.{0,40}"
     r"\b(command|script|server|backend|frontend|docker|container|service|process)\b"
-    r"|\b(make.*changes|apply.*changes|check.*changes|move.*changes)\b",
+    r"|\b(make.*changes|apply.*changes|check.*changes|move.*changes)\b"
+    # Affirmative go-aheads and "implement the suggestions"-style follow-ups
+    r"|\b(implement|apply|make|do)\b.{0,60}"
+    r"\b(suggestions?|recommendations?|proposals?|improvements?|fix(?:es)?|changes?|plans?|patch(?:es)?|edits?)\b"
+    r"|\b(go ahead|proceed|do it|make it so|ship it|implement it|apply it|implement this|apply this)\b",
     re.IGNORECASE | re.DOTALL,
 )
 

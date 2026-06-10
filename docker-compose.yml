@@ -21,8 +21,11 @@ services:
       - leadagent-net
     volumes:
       - .:/app/leadagent-data
-      - ${HOME}/.claude:/root/.claude
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Agent images run as the non-root `node` user, so auth lands in /home/node
+      - ${HOME}/.claude:/home/node/.claude
+      # NOTE: the Docker socket is deliberately NOT mounted here. An agent with
+      # access to /var/run/docker.sock can start a privileged container and
+      # escape to root on the host — a prompt-injected agent must not have it.
       # Mirror host projects path
       - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     restart: unless-stopped
@@ -42,10 +45,10 @@ services:
       - leadagent-net
     volumes:
       - .:/app/leadagent-data
-      - ${HOME}/.gemini:/root/.gemini
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${HOME}/.config/google-chrome:/root/.config/google-chrome:ro
-      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+      - ${HOME}/.gemini:/home/node/.gemini
+      # Docker socket intentionally omitted — see claude-agent note.
+      - ${HOME}/.config/google-chrome:/home/node/.config/google-chrome:ro
+      - ${HOME}/.config/gcloud:/home/node/.config/gcloud:ro
       # Mirror host projects path
       - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     restart: unless-stopped
@@ -99,7 +102,8 @@ services:
     networks:
       - leadagent-net
     ports:
-      - "8000:8000"
+      # Bind to loopback only — the daemon must not be reachable from the LAN.
+      - "127.0.0.1:8000:8000"
     volumes:
       - .:/app/leadagent-data
       - /var/run/docker.sock:/var/run/docker.sock
@@ -161,9 +165,10 @@ services:
     command: python backend/slack_bot.py
     volumes:
       - .:/app/leadagent-data
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${HOME}/.claude:/root/.claude
-      - ${HOME}/.gemini:/root/.gemini
+      # No Docker socket: the Slack bot only forwards prompts to the backend.
+      # Credentials are read-only — the bot never needs to refresh them.
+      - ${HOME}/.claude:/root/.claude:ro
+      - ${HOME}/.gemini:/root/.gemini:ro
       # Mirror host projects path
       - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     environment:
@@ -177,7 +182,8 @@ services:
 
   # ── Local SLM (Ollama) ──────────────────────────────────────────────────────
   ollama:
-    image: ollama/ollama:latest
+    # Pinned — `latest` can silently change model/runtime behavior between pulls
+    image: ollama/ollama:0.30.7
     container_name: leadagent-ollama
     labels:
       - "com.leadagent.tag=true"
