@@ -116,8 +116,14 @@ services:
       - LEADAGENT_DOCKER_MODE=1
       - LEADAGENT_TAG=true
       - LEADAGENT_WORKSPACE=${LEADAGENT_WORKSPACE}
+      # 3B is enough for the routing classifier; llama3 (8B, ~5.5 GB loaded)
+      # cannot fit in this VM alongside the rest of the stack.
+      - LEADAGENT_OLLAMA_MODEL=llama3.2:3b
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Hard cap so a memory spike OOM-kills inside this cgroup (restart policy
+    # recovers it) instead of triggering a VM-wide kernel OOM kill.
+    mem_limit: 2g
     restart: unless-stopped
     depends_on:
       - claude-agent
@@ -150,6 +156,8 @@ services:
       - LEADAGENT_WORKSPACE=${LEADAGENT_WORKSPACE}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Runs the indexer (opens kuzu too) — same containment as the backend.
+    mem_limit: 2g
     restart: unless-stopped
     depends_on:
       - backend
@@ -193,6 +201,9 @@ services:
       - "11434:11434"
     volumes:
       - ./leadagent-data/ollama:/root/.ollama
+    # Model loads are the biggest single allocation in the stack — it was an
+    # ollama llama-server load that tripped the VM-wide OOM kill.
+    mem_limit: 3g
     restart: unless-stopped
 
 # NOTE — agentmemory is NOT included here.
