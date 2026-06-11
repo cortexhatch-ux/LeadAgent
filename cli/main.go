@@ -1165,11 +1165,28 @@ func handlePermissionRequest(rawJSON string) {
 		fmt.Printf("%s%s│%s  Input:\n    %s%s%s\n", Bold, Yellow, Reset, Dim+Gray, inputStr, Reset)
 	}
 	fmt.Printf("%s%s╰───────────────────────────────────────────────────────╯%s\n", Bold, Yellow, Reset)
-	fmt.Printf("  %s[a]%s allow once  %s[A]%s allow session  %s[d]%s deny  %s[s]%s stop agent  > ",
-		Green+Bold, Reset, Green+Bold, Reset, Red+Bold, Reset, Red+Bold, Reset)
+	fmt.Printf("  %s[a]%s allow once  %s[A]%s allow session  %s[d]%s deny  %s[g]%s guide  %s[s]%s stop agent  > ",
+		Green+Bold, Reset, Green+Bold, Reset, Red+Bold, Reset, Yellow+Bold, Reset, Red+Bold, Reset)
 
 	behavior := "deny"
 	scope := "once"
+	message := ""
+
+	readGuidance := func() {
+		fmt.Printf("  %sGuidance for the agent:%s ", Yellow, Reset)
+		scanner := bufio.NewScanner(os.Stdin)
+		if scanner.Scan() {
+			message = strings.TrimSpace(scanner.Text())
+		}
+		behavior = "deny"
+		if message != "" {
+			message = "The user paused this tool call to give you guidance: " + message +
+				" — adjust your approach accordingly and continue."
+			fmt.Printf("  %s→ Guidance sent%s\n", Yellow, Reset)
+		} else {
+			fmt.Printf("  %s✗ Denied (no guidance entered)%s\n", Red, Reset)
+		}
+	}
 
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err == nil {
@@ -1187,6 +1204,8 @@ func handlePermissionRequest(rawJSON string) {
 		case 'd':
 			behavior = "deny"
 			fmt.Printf("  %s✗ Denied%s\n", Red, Reset)
+		case 'g':
+			readGuidance()
 		case 's':
 			behavior = "stop"
 			fmt.Printf("  %s✗ Stopped agent%s\n", Red, Reset)
@@ -1207,6 +1226,8 @@ func handlePermissionRequest(rawJSON string) {
 					behavior, scope = "allow", "session"
 				case 'd':
 					behavior = "deny"
+				case 'g':
+					readGuidance()
 				case 's':
 					behavior = "stop"
 				}
@@ -1216,6 +1237,9 @@ func handlePermissionRequest(rawJSON string) {
 	}
 
 	decBody := map[string]string{"behavior": behavior, "scope": scope}
+	if message != "" {
+		decBody["message"] = message
+	}
 	decJSON, _ := json.Marshal(decBody)
 	client := &http.Client{Timeout: 5 * time.Second}
 	client.Post(
