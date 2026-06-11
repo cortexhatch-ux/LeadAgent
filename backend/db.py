@@ -10,7 +10,11 @@ class GraphDB:
         parent_dir = os.path.dirname(db_path)
         if parent_dir and not os.path.exists(parent_dir):
             os.makedirs(parent_dir)
-        self.db = kuzu.Database(db_path)
+        # Kuzu's default buffer pool is ~80% of system memory, which inside a
+        # container means the whole Docker VM — large enough to get the daemon
+        # picked by the kernel OOM killer under memory pressure.
+        buffer_mb = int(os.environ.get("LEADAGENT_KUZU_BUFFER_MB", "1024"))
+        self.db = kuzu.Database(db_path, buffer_pool_size=buffer_mb * 1024 * 1024)
         self.connection = kuzu.Connection(self.db)
         self._lock = threading.Lock()
         self._init_schema()

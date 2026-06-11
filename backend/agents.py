@@ -665,8 +665,8 @@ import requests
 
 class OllamaAgent:
     """Agent that talks to a local Ollama server."""
-    def __init__(self, model: str = "llama3"):
-        self.model = model
+    def __init__(self, model: str = ""):
+        self.model = model or os.environ.get("LEADAGENT_OLLAMA_MODEL", "llama3")
         default_host = "http://ollama:11434" if os.environ.get("LEADAGENT_DOCKER_MODE") else "http://localhost:11434"
         self.url = os.environ.get("OLLAMA_HOST", default_host)
 
