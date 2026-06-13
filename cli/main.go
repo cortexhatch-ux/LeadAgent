@@ -13,9 +13,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -306,7 +309,40 @@ func runSetupWizard() {
 	cmd.Run()
 }
 
+var version = "0.3.0"
+
+func printVersion() {
+	rev, dirty := "", ""
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.modified":
+				if s.Value == "true" {
+					dirty = "-dirty"
+				}
+			}
+		}
+	}
+	if len(rev) > 7 {
+		rev = rev[:7]
+	}
+	if rev != "" {
+		fmt.Printf("leadagent %s (%s%s)\n", version, rev, dirty)
+	} else {
+		fmt.Printf("leadagent %s\n", version)
+	}
+}
+
 func main() {
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-v" || arg == "version" {
+			printVersion()
+			return
+		}
+	}
+
 	initSigintHandler()
 	go initProject()
 
@@ -1138,6 +1174,95 @@ func buildPromptWithHistory(prompt string, history []conversationTurn) string {
 	return sb.String()
 }
 
+// keyListener owns stdin while a chat stream is active so single keypresses
+// (e.g. [g]uide) can be detected without line buffering.
+type keyListener struct {
+	keys    chan byte
+	stop    chan struct{}
+	done    chan struct{}
+	restore func()
+}
+
+func startKeyListener() *keyListener {
+	fd := int(os.Stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return nil
+	}
+	restore, err := enterCbreak(fd)
+	if err != nil {
+		return nil
+	}
+	kl := &keyListener{
+		keys:    make(chan byte, 16),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
+		restore: restore,
+	}
+	go func() {
+		defer close(kl.done)
+		buf := make([]byte, 1)
+		for {
+			select {
+			case <-kl.stop:
+				return
+			default:
+			}
+			n, err := unix.Read(fd, buf) // VTIME-bounded: returns within ~200ms
+			if n > 0 {
+				select {
+				case kl.keys <- buf[0]:
+				case <-kl.stop:
+					return
+				}
+			} else if err != nil && err != unix.EINTR && err != unix.EAGAIN {
+				return
+			}
+		}
+	}()
+	return kl
+}
+
+func (kl *keyListener) Close() {
+	close(kl.stop)
+	<-kl.done
+	kl.restore()
+}
+
+func postInterrupt(sessionID string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	client.Post(
+		fmt.Sprintf("http://localhost:8000/permission/interrupt/%s", sessionID),
+		"application/json", nil,
+	)
+}
+
+// readLineKeys reads a line byte-by-byte with manual echo (terminal echo is
+// off while the keyListener is active).
+func readLineKeys(getKey func() byte) string {
+	var sb []byte
+	for {
+		b := getKey()
+		switch {
+		case b == '\r' || b == '\n':
+			fmt.Println()
+			return string(sb)
+		case b == 0x7f || b == 8: // backspace
+			if len(sb) > 0 {
+				sb = sb[:len(sb)-1]
+				fmt.Print("\b \b")
+			}
+		case b == 3: // ctrl-c
+			fmt.Println()
+			return ""
+		default:
+			if b >= 32 {
+				sb = append(sb, b)
+				fmt.Printf("%c", b)
+			}
+		}
+	}
+}
+
 type permissionPayload struct {
 	ID       string                 `json:"id"`
 	ToolName string                 `json:"tool_name"`
@@ -1145,7 +1270,10 @@ type permissionPayload struct {
 	Agent    string                 `json:"agent"`
 }
 
-func handlePermissionRequest(rawJSON string) {
+// handlePermissionRequest prompts the user for a tool-permission decision.
+// getKey, when non-nil, supplies keypresses from the stream's keyListener;
+// otherwise stdin is read directly.
+func handlePermissionRequest(rawJSON string, getKey func() byte) {
 	var pr permissionPayload
 	if err := json.Unmarshal([]byte(rawJSON), &pr); err != nil {
 		fmt.Printf("\n%s⚠️  Malformed permission request%s\n", Yellow, Reset)
@@ -1174,9 +1302,13 @@ func handlePermissionRequest(rawJSON string) {
 
 	readGuidance := func() {
 		fmt.Printf("  %sGuidance for the agent:%s ", Yellow, Reset)
-		scanner := bufio.NewScanner(os.Stdin)
-		if scanner.Scan() {
-			message = strings.TrimSpace(scanner.Text())
+		if getKey != nil {
+			message = strings.TrimSpace(readLineKeys(getKey))
+		} else {
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				message = strings.TrimSpace(scanner.Text())
+			}
 		}
 		behavior = "deny"
 		if message != "" {
@@ -1188,13 +1320,9 @@ func handlePermissionRequest(rawJSON string) {
 		}
 	}
 
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err == nil {
-		b := make([]byte, 1)
-		os.Stdin.Read(b)
-		term.Restore(int(os.Stdin.Fd()), oldState)
+	decideByte := func(b byte) {
 		fmt.Println()
-		switch b[0] {
+		switch b {
 		case 'a':
 			behavior, scope = "allow", "once"
 			fmt.Printf("  %s✓ Allowed once%s\n", Green, Reset)
@@ -1213,6 +1341,15 @@ func handlePermissionRequest(rawJSON string) {
 			behavior = "deny"
 			fmt.Printf("  %s✗ Denied%s\n", Red, Reset)
 		}
+	}
+
+	if getKey != nil {
+		decideByte(getKey())
+	} else if oldState, err := term.MakeRaw(int(os.Stdin.Fd())); err == nil {
+		b := make([]byte, 1)
+		os.Stdin.Read(b)
+		term.Restore(int(os.Stdin.Fd()), oldState)
+		decideByte(b[0])
 	} else {
 		// Fallback: line-based input when raw mode is unavailable
 		scanner := bufio.NewScanner(os.Stdin)
@@ -1304,16 +1441,56 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 	// Spinner stays alive while we read the body — stop it on first real content line
 	contentType := resp.Header.Get("Content-Type")
 	if strings.Contains(contentType, "text/plain") {
+		// Listen for [g] mid-run: pauses the agent at its next tool call.
+		var permForward atomic.Pointer[chan byte]
+		var getPromptKey func() byte
+		kl := startKeyListener()
+		if kl != nil {
+			defer kl.Close()
+			dispatchDone := make(chan struct{})
+			defer close(dispatchDone)
+			go func() {
+				for {
+					select {
+					case <-dispatchDone:
+						return
+					case b := <-kl.keys:
+						if chp := permForward.Load(); chp != nil {
+							select {
+							case *chp <- b:
+							case <-dispatchDone:
+								return
+							}
+							continue
+						}
+						if b == 'g' || b == 'G' {
+							go postInterrupt(sessionID)
+							fmt.Printf("\n%s⏸  Guide requested — the agent will pause at its next tool call so you can give guidance.%s\n", Yellow, Reset)
+						}
+					}
+				}
+			}()
+			promptKeys := make(chan byte)
+			getPromptKey = func() byte {
+				permForward.Store(&promptKeys)
+				b := <-promptKeys
+				permForward.Store(nil)
+				return b
+			}
+		}
 		agentName := agent
 		spinnerStopped := false
 		progressHeaderShown := false
 
 		var timingLines []string
+		// blocks holds pointers: agentBlock embeds a strings.Builder, which
+		// must never be copied after first use (its hidden self-pointer would
+		// leak a stack address into the heap and crash the GC).
 		type agentBlock struct {
 			name    string
 			content strings.Builder
 		}
-		var blocks []agentBlock
+		var blocks []*agentBlock
 		currentBlock := &agentBlock{name: agentName}
 		isFanout := false
 
@@ -1355,7 +1532,7 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 						stopSpinner()
 						spinnerStopped = true
 					}
-					handlePermissionRequest(payload)
+					handlePermissionRequest(payload, getPromptKey)
 					stopSpinner, updateSpinner = startSpinner(agentName)
 					spinnerStopped = false
 					continue
@@ -1364,7 +1541,7 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 				// Fan-out agent separator
 				if strings.HasPrefix(trimmed, "◆  ") {
 					isFanout = true
-					blocks = append(blocks, *currentBlock)
+					blocks = append(blocks, currentBlock)
 					newName := strings.ToLower(strings.TrimPrefix(trimmed, "◆  "))
 					currentBlock = &agentBlock{name: newName}
 					agentName = newName
@@ -1403,7 +1580,7 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 				break
 			}
 		}
-		blocks = append(blocks, *currentBlock)
+		blocks = append(blocks, currentBlock)
 
 		if !spinnerStopped {
 			stopSpinner()

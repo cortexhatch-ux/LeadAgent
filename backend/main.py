@@ -419,8 +419,20 @@ class _PermissionDecision(BaseModel):
 
 @app.post("/permission/_request")
 async def permission_request(body: _PermissionRequestBody):
+    if broker.consume_interrupt(body.session_id):
+        pr = broker.create(body.session_id, body.agent, body.tool_name, body.input)
+        return {"id": pr.id}
+    if broker.is_allowed(body.session_id, body.agent, body.tool_name, body.input):
+        return {"id": None, "allowed": True}
     pr = broker.create(body.session_id, body.agent, body.tool_name, body.input)
     return {"id": pr.id}
+
+
+@app.post("/permission/interrupt/{session_id}")
+async def permission_interrupt(session_id: str):
+    broker.set_interrupt(session_id)
+    broker.set_interrupt(f"{session_id}:subagent")
+    return {"status": "ok"}
 
 
 @app.get("/permission/{request_id}/wait")

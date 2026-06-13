@@ -32,6 +32,19 @@ class PermissionBroker:
         self._pending: Dict[str, PermissionRequest] = {}
         self._session_queues: Dict[str, "queue.Queue[PermissionRequest]"] = {}
         self._allow_cache: Dict[Tuple[str, str, str, str], bool] = {}
+        self._interrupts: set = set()
+
+    # ── mid-run interrupt: force the next tool call to prompt the user ─────
+    def set_interrupt(self, session_id: str) -> None:
+        with self._lock:
+            self._interrupts.add(session_id)
+
+    def consume_interrupt(self, session_id: str) -> bool:
+        with self._lock:
+            if session_id in self._interrupts:
+                self._interrupts.discard(session_id)
+                return True
+            return False
 
     # ── session-scoped queues (chat stream subscribes here) ────────────────
     def session_queue(self, session_id: str) -> "queue.Queue[PermissionRequest]":

@@ -147,7 +147,17 @@ def _ask_permission(id_: object, args: dict) -> None:
             timeout=5,
         )
         resp.raise_for_status()
-        req_id = resp.json()["id"]
+        req_data = resp.json()
+        if req_data.get("allowed"):
+            # Session-allowed earlier — skip the user prompt entirely
+            _send({
+                "jsonrpc": "2.0", "id": id_,
+                "result": {"content": [{"type": "text", "text": json.dumps({
+                    "behavior": "allow", "updatedInput": input_,
+                })}], "isError": False},
+            })
+            return
+        req_id = req_data["id"]
 
         # Block until the user decides (up to 10 minutes)
         wait_resp = requests.get(
