@@ -33,7 +33,8 @@ full_health_func.txt
 handle_health.txt
 health_block.txt
 screenshot.png
- junk/
+junk/
+.claude/
 
 # Logs
 *.log
