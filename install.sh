@@ -116,7 +116,7 @@ fi
 
 # ─── 4. Go CLI ───────────────────────────────────────────────────────────────
 say "Building LeadAgent CLI"
-( cd "$PROJECT_ROOT/cli" && go build -o leadagent main.go )
+( cd "$PROJECT_ROOT/cli" && go build -o leadagent . )
 ok "CLI built at cli/leadagent"
 
 # ─── 5. Shell rc ─────────────────────────────────────────────────────────────
