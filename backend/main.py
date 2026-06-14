@@ -940,4 +940,7 @@ if __name__ == "__main__":
     # 127.0.0.1 on the host (see docker-compose.yml).
     default_host = "0.0.0.0" if os.environ.get("LEADAGENT_DOCKER_MODE") else "127.0.0.1"
     bind_host = os.environ.get("LEADAGENT_BIND_HOST", default_host)
-    uvicorn.run(app, host=bind_host, port=8000)
+    # Native mode uses 8001 to avoid conflicts with Docker mode (8000)
+    default_port = 8000 if os.environ.get("LEADAGENT_DOCKER_MODE") else 8001
+    bind_port = int(os.environ.get("LEADAGENT_PORT", default_port))
+    uvicorn.run(app, host=bind_host, port=bind_port)

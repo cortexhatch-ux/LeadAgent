@@ -533,7 +533,9 @@ class CLIAgent:
         self, prompt: str, cwd: str, session_id: str, use_stdin: bool, mode: str = "plan"
     ) -> Generator[str, None, None]:
         """Run claude with stream-json output and MCP permission tool."""
-        backend_url = "http://leadagent-backend:8000" if os.environ.get("LEADAGENT_DOCKER_MODE") else "http://localhost:8000"
+        # Use the configured port (default 8000 for Docker, 8001 for native)
+        port = int(os.environ.get("LEADAGENT_PORT", 8000 if os.environ.get("LEADAGENT_DOCKER_MODE") else 8001))
+        backend_url = f"http://leadagent-backend:{port}" if os.environ.get("LEADAGENT_DOCKER_MODE") else f"http://localhost:{port}"
         
         # Use python3 as the command in containers, sys.executable locally
         python_cmd = "python3" if os.environ.get("LEADAGENT_DOCKER_MODE") else sys.executable

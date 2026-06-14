@@ -11,7 +11,8 @@ import sys
 
 import requests
 
-BACKEND_URL = os.environ.get("LEADAGENT_BACKEND_URL", "http://localhost:8000")
+port = 8000 if os.environ.get("LEADAGENT_DOCKER_MODE") else 8001
+BACKEND_URL = os.environ.get("LEADAGENT_BACKEND_URL", f"http://localhost:{port}")
 SESSION_ID = os.environ.get("LEADAGENT_SESSION_ID", "default")
 AGENT_NAME = os.environ.get("LEADAGENT_AGENT_NAME", "claude")
 

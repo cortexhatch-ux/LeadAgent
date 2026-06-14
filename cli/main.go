@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -45,6 +46,28 @@ type DebateRequest struct {
 	Agents []string `json:"agents,omitempty"`
 	CWD    string   `json:"cwd,omitempty"`
 	Force  bool     `json:"force,omitempty"`
+}
+
+func backendURL() string {
+	// Try default/Docker port first
+	if isPortOpen(8000) {
+		return "http://localhost:8000"
+	}
+	// Try native port second
+	if isPortOpen(8001) {
+		return "http://localhost:8001"
+	}
+	// Fallback to default
+	return "http://localhost:8000"
+}
+
+func isPortOpen(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", port), 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 type ChatResponse struct {
@@ -504,13 +527,13 @@ func initProject() {
 	cwd, _ := os.Getwd()
 	reqBody := map[string]string{"path": cwd}
 	jsonData, _ := json.Marshal(reqBody)
-	http.Post("http://localhost:8000/project/init", "application/json", bytes.NewBuffer(jsonData))
+	http.Post(backendURL() + "/project/init", "application/json", bytes.NewBuffer(jsonData))
 }
 
 func isBackendUp() bool {
 	// Increased timeout to 2s to account for Docker networking overhead
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://localhost:8000/health")
+	resp, err := client.Get(backendURL() + "/health")
 	if err != nil {
 		return false
 	}
@@ -831,7 +854,7 @@ func startREPL() {
 				"project_id": projectID,
 			}
 			jsonData, _ := json.Marshal(reqBody)
-			resp, err := http.Post("http://localhost:8000/memory/forget", "application/json", bytes.NewBuffer(jsonData))
+			resp, err := http.Post(backendURL() + "/memory/forget", "application/json", bytes.NewBuffer(jsonData))
 			if err != nil {
 				fmt.Printf("\n%s❌ Error connecting to LeadAgent daemon: %v%s\n", Red, err, Reset)
 				continue
@@ -984,7 +1007,7 @@ func drawDashboard() {
 	client := &http.Client{Timeout: 2 * time.Second}
 	var health HealthResponse
 	backendOnline := false
-	resp, err := client.Get("http://localhost:8000/health")
+	resp, err := client.Get(backendURL() + "/health")
 	if err == nil {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
@@ -1087,7 +1110,7 @@ func getAgentColor(agent string) string {
 }
 
 func printRoles() {
-	resp, err := http.Get("http://localhost:8000/roles")
+	resp, err := http.Get(backendURL() + "/roles")
 	if err != nil {
 		fmt.Printf("%s  Could not fetch roles from daemon.%s\n\n", Red, Reset)
 		return
@@ -1289,7 +1312,7 @@ func (kl *keyListener) Close() {
 func postInterrupt(sessionID string) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	client.Post(
-		fmt.Sprintf("http://localhost:8000/permission/interrupt/%s", sessionID),
+		fmt.Sprintf(backendURL() + "/permission/interrupt/%s", sessionID),
 		"application/json", nil,
 	)
 }
@@ -1438,7 +1461,7 @@ func handlePermissionRequest(rawJSON string, getKey func() byte) {
 	decJSON, _ := json.Marshal(decBody)
 	client := &http.Client{Timeout: 5 * time.Second}
 	client.Post(
-		fmt.Sprintf("http://localhost:8000/permission/%s/decide", pr.ID),
+		fmt.Sprintf(backendURL() + "/permission/%s/decide", pr.ID),
 		"application/json",
 		bytes.NewBuffer(decJSON),
 	)
@@ -1469,7 +1492,7 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 		setRequestCancel(nil)
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost:8000/chat", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, backendURL() + "/chat", bytes.NewBuffer(jsonData))
 	if err != nil {
 		stopSpinner()
 		fmt.Printf("%s  Error building request: %v%s\n", Red, err, Reset)
@@ -1754,7 +1777,7 @@ func sendDebate(prompt string, rounds int, agents []string, cwd string, force bo
 		setRequestCancel(nil)
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost:8000/debate", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, backendURL() + "/debate", bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Printf("%s❌ Error building debate request: %v%s\n", Red, err, Reset)
 		return
@@ -1971,7 +1994,7 @@ func statusDot(ok bool) string {
 }
 
 func handleHealth() {
-	resp, err := http.Get("http://localhost:8000/health")
+	resp, err := http.Get(backendURL() + "/health")
 	if err != nil {
 		fmt.Printf("\n%s%s┌─────────────────────────────────────────┐%s\n", Bold, Cyan, Reset)
 		fmt.Printf("%s%s│         %s⚠️  SYSTEM OFFLINE             %s%s│%s\n", Bold, Cyan, Yellow, Bold, Cyan, Reset)
@@ -2104,7 +2127,7 @@ func handleDoctor() {
 
 	// Backend-side full doctor.
 	client := &http.Client{Timeout: 6 * time.Second}
-	resp, err := client.Get("http://localhost:8000/doctor")
+	resp, err := client.Get(backendURL() + "/doctor")
 	if err != nil {
 		printDoctorRow("backend", false, "offline — start with ./start_backend.sh")
 		fmt.Printf("%s%s╰────────────────────────────────────────────╯%s\n\n", Bold, Cyan, Reset)
@@ -2160,7 +2183,7 @@ func handleQuery(cypher string) {
 	reqBody := map[string]string{"cypher": cypher}
 	jsonData, _ := json.Marshal(reqBody)
 
-	resp, err := http.Post("http://localhost:8000/memory/query", "application/json", bytes.NewBuffer(jsonData))
+	resp, err := http.Post(backendURL() + "/memory/query", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return

@@ -30,9 +30,9 @@ BACKEND_CONTAINER = "leadagent-backend"
 # True when running inside a Docker container
 IN_DOCKER = os.path.exists("/.dockerenv")
 
-HEALTH_URL = (
-    "http://backend:8000/health" if IN_DOCKER else "http://localhost:8000/health"
-)
+port = 8000 if IN_DOCKER else 8001
+HEALTH_URL = f"http://backend:{port}/health" if IN_DOCKER else f"http://localhost:{port}/health"
+
 AGENTMEMORY_PORT = 3111
 MAX_FAILURES = 3
 DOCKER_SOCK = "/var/run/docker.sock"
