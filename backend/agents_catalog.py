@@ -25,6 +25,7 @@ class AgentSpec:
     vendor: str
     color: str
     npm_pkg: Optional[str] = None
+    install_cmd: Optional[str] = None  # override for non-npm installs
     login_cmd: Optional[str] = None
     auth_check: Optional[list[str]] = None
     note: Optional[str] = None
@@ -85,10 +86,11 @@ AGENTS: dict[str, AgentSpec] = {
         display="Grok",
         vendor="xAI",
         color="#e8a840",
-        npm_pkg=None,
-        login_cmd=None,
-        auth_check=None,
-        note="CLI not yet released by xAI",
+        npm_pkg="@xai-official/grok",
+        install_cmd=None,
+        login_cmd="grok login",
+        auth_check=["grok", "models"],
+        note=None,
     ),
     "ollama": AgentSpec(
         key="ollama",

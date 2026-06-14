@@ -2,8 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -199,14 +197,9 @@ func TestPermissionPayload_MissingFields(t *testing.T) {
 	}
 }
 
-// ── isBackendUp — via httptest ────────────────────────────────────────────────
+// ── isBackendUp ───────────────────────────────────────────────────────────────
 
 func TestIsBackendUp_WhenServerRunning(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
 	// We can't easily inject the URL into isBackendUp without refactoring,
 	// so just verify the function exists and returns a bool.
 	// Full integration tested via the backend itself.

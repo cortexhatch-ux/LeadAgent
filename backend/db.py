@@ -25,11 +25,17 @@ class GraphDB:
         except Exception:
             pass  # Table already exists
 
+    def _try_alter(self, stmt: str):
+        try:
+            self.connection.execute(stmt)
+        except Exception:
+            pass
+
     def _init_schema(self):
         # Node tables — added project_id, confidence, last_seen for hygiene
         self._try_create(
             "CREATE NODE TABLE Entity(name STRING, type STRING, description STRING, "
-            "project_id STRING, confidence DOUBLE, last_seen DOUBLE, PRIMARY KEY (name))"
+            "project_id STRING, confidence DOUBLE, last_seen DOUBLE, error_sourced BOOLEAN, PRIMARY KEY (name))"
         )
         self._try_create(
             "CREATE NODE TABLE Concept(name STRING, description STRING, "
@@ -37,7 +43,7 @@ class GraphDB:
         )
         self._try_create(
             "CREATE NODE TABLE Question(id STRING, prompt STRING, answer STRING, agent STRING, "
-            "timestamp DOUBLE, project_id STRING, PRIMARY KEY (id))"
+            "timestamp DOUBLE, project_id STRING, error_sourced BOOLEAN, PRIMARY KEY (id))"
         )
         self._try_create(
             "CREATE NODE TABLE File(path STRING, name STRING, extension STRING, "
@@ -61,6 +67,7 @@ class GraphDB:
         )
         self._try_create("CREATE REL TABLE CONTAINS(FROM Folder TO Folder)")
         self._try_create("CREATE REL TABLE HAS_FILE(FROM Folder TO File)")
+        self._try_create("CREATE REL TABLE DEFINED_IN(FROM Entity TO File)")
         self._try_create("CREATE REL TABLE MENTIONS(FROM Entity TO Concept)")
         self._try_create("CREATE REL TABLE ABOUT(FROM Question TO Entity)")
         self._try_create("CREATE REL TABLE DISCUSSES(FROM Question TO Concept)")
@@ -74,10 +81,6 @@ class GraphDB:
         )
 
         # MCP Rules layer — evaluated before user permission prompts
-        # action: "allow" | "deny" | "ask"
-        # scope:  "global" | "agent:<name>" | "session:<id>"
-        # tool_pattern: exact tool name or glob prefix (e.g. "bash*", "write_file")
-        # input_match: JSON string of key:value pairs that must all match input (optional)
         self._try_create(
             "CREATE NODE TABLE MCPRule("
             "id STRING, "
@@ -90,6 +93,10 @@ class GraphDB:
             "created_at DOUBLE, "
             "PRIMARY KEY (id))"
         )
+
+        # Migrations
+        self._try_alter("ALTER TABLE Entity ADD error_sourced BOOLEAN DEFAULT false")
+        self._try_alter("ALTER TABLE Question ADD error_sourced BOOLEAN DEFAULT false")
 
     # ── write methods (all lock-protected) ──────────────────────────────────
 
@@ -147,7 +154,7 @@ class GraphDB:
                 pass
 
     def add_entity(
-        self, name: str, type: str, description: str = "", project_id: str = "default"
+        self, name: str, type: str, description: str = "", project_id: str = "default", error_sourced: bool = False
     ):
         now = time.time()
         with self._lock:
@@ -155,9 +162,9 @@ class GraphDB:
                 # Try update first. If MATCH succeeds, SET will run.
                 res = self.connection.execute(
                     "MATCH (e:Entity {name: $name}) "
-                    "SET e.last_seen = $now, e.confidence = COALESCE(e.confidence, 0.9) + 0.1 "
+                    "SET e.last_seen = $now, e.confidence = COALESCE(e.confidence, 0.9) + 0.1, e.error_sourced = $es "
                     "RETURN count(e)",
-                    {"name": name, "now": now},
+                    {"name": name, "now": now, "es": error_sourced},
                 )
                 if res.has_next() and res.get_next()[0] > 0:
                     return
@@ -165,13 +172,14 @@ class GraphDB:
                 # If not found, create new
                 self.connection.execute(
                     "CREATE (e:Entity {name: $name, type: $type, description: $description, "
-                    "project_id: $pid, confidence: 1.0, last_seen: $now})",
+                    "project_id: $pid, confidence: 1.0, last_seen: $now, error_sourced: $es})",
                     {
                         "name": name,
                         "type": type,
                         "description": description,
                         "pid": project_id,
                         "now": now,
+                        "es": error_sourced,
                     },
                 )
             except Exception as e:
@@ -220,15 +228,48 @@ class GraphDB:
             except Exception:
                 pass
 
+    def link_entity_to_file(self, entity_name: str, file_path: str):
+        with self._lock:
+            try:
+                self.connection.execute(
+                    "MATCH (e:Entity {name: $ename}), (f:File {path: $fpath}) "
+                    "MERGE (e)-[:DEFINED_IN]->(f)",
+                    {"ename": entity_name, "fpath": file_path},
+                )
+            except Exception:
+                pass
+
+    def prune_file(self, file_path: str):
+        """Remove a file and any entities that were ONLY defined in that file."""
+        with self._lock:
+            try:
+                # Delete entities that are ONLY in this file
+                self.connection.execute(
+                    "MATCH (e:Entity)-[:DEFINED_IN]->(f:File {path: $path}) "
+                    "OPTIONAL MATCH (e)-[other:DEFINED_IN]->(f2:File) WHERE f2.path <> $path "
+                    "WITH e, count(other) as other_links "
+                    "WHERE other_links = 0 "
+                    "DELETE e",
+                    {"path": file_path}
+                )
+                
+                # Delete the file node itself
+                self.connection.execute(
+                    "MATCH (f:File {path: $path}) DELETE f",
+                    {"path": file_path}
+                )
+            except Exception as e:
+                print(f"[prune_file] Error: {e}")
+
     def add_question(
-        self, prompt: str, answer: str, agent: str, project_id: str = "default"
+        self, prompt: str, answer: str, agent: str, project_id: str = "default", error_sourced: bool = False
     ) -> str:
         qid = str(uuid.uuid4())
         with self._lock:
             try:
                 self.connection.execute(
                     "CREATE (q:Question {id: $id, prompt: $prompt, answer: $answer, "
-                    "agent: $agent, timestamp: $ts, project_id: $pid})",
+                    "agent: $agent, timestamp: $ts, project_id: $pid, error_sourced: $es})",
                     {
                         "id": qid,
                         "prompt": prompt[:500],
@@ -236,6 +277,7 @@ class GraphDB:
                         "agent": agent,
                         "ts": time.time(),
                         "pid": project_id,
+                        "es": error_sourced,
                     },
                 )
             except Exception:
@@ -268,11 +310,16 @@ class GraphDB:
                     {"now": now},
                 )
 
-                # 2. Prune low confidence or very old nodes
+                # 2. Prune low confidence, very old nodes, or error-sourced nodes
                 self.connection.execute(
-                    "MATCH (e:Entity) WHERE e.confidence < 0.1 OR $now - e.last_seen > $ttl "
+                    "MATCH (e:Entity) WHERE e.confidence < 0.1 OR $now - e.last_seen > $ttl OR e.error_sourced = true "
                     "DELETE e",
                     {"now": now, "ttl": ttl_seconds},
+                )
+                
+                # 3. Prune error-sourced questions too
+                self.connection.execute(
+                    "MATCH (q:Question) WHERE q.error_sourced = true DELETE q"
                 )
             except Exception as e:
                 print(f"[Hygiene] Error: {e}")

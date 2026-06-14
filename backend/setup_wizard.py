@@ -57,6 +57,8 @@ FONT_SIZE_HUGE = 36
 
 
 def _install_cmd(spec) -> str:
+    if spec.install_cmd:
+        return spec.install_cmd
     return f"npm install -g --prefix {NPM_PREFIX} {spec.npm_pkg}"
 
 
@@ -549,7 +551,7 @@ class SetupWizard:
                 return
             self.selected = sel
             installable = [
-                k for k in AGENT_ORDER if k in self.selected and AGENTS[k].npm_pkg
+                k for k in AGENT_ORDER if k in self.selected and (AGENTS[k].npm_pkg or AGENTS[k].install_cmd)
             ]
             self.steps = (
                 [("Welcome", self._welcome), ("Your Plans", self._select)]

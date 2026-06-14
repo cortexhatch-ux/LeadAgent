@@ -409,13 +409,17 @@ Output your plan as a structured "INTERNAL REASONING" block.
         if not available:
             return ["none"], {}
 
+        # ── User Overrides (Strictly single-agent) ──
         if preferred_agent and preferred_agent in available:
-            return [preferred_agent], {}
+            return [preferred_agent], {"mode": _detect_execute_mode(prompt)}
 
         if prompt:
             inferred = self._infer_agents_from_prompt(prompt)
             valid = [a for a in inferred if a in available]
             if valid:
+                # If the user named exactly one agent, stick to it (no double billing)
+                if len(valid) == 1:
+                    return valid, {"mode": _detect_execute_mode(prompt), "force_single": True}
                 return valid, {"mode": _detect_execute_mode(prompt)}
 
         # ── Tier 0: SLM-based routing (Ollama) ──
@@ -427,6 +431,9 @@ Output your plan as a structured "INTERNAL REASONING" block.
                 a for a in slm_decision.get("recommended_agents", []) if a in available
             ]
             if recommended:
+                # Only fan-out on high complexity; trim to single agent otherwise
+                if complexity != "high" and len(recommended) > 1:
+                    recommended = recommended[:1]
                 # For high complexity, generate internal reasoning block
                 if complexity == "high":
                     reasoning = self._reason_task_slm(prompt)
@@ -445,7 +452,8 @@ Output your plan as a structured "INTERNAL REASONING" block.
         best_affinity = self._get_best_affinity_agent(task_type, available)
         if best_affinity:
             # Check if this task warrants adversarial review (Consensus Round 3)
-            if task_type in ("deep_analysis", "logic") or complexity == "high":
+            # Only add a critic if the user didn't ask for a specific agent
+            if (task_type in ("deep_analysis", "logic") or complexity == "high") and not preferred_agent:
                 # For high complexity, add a second agent to critique
                 critics = [a for a in available if a != best_affinity]
                 if critics:

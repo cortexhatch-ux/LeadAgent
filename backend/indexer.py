@@ -75,6 +75,7 @@ def process_file(file_path: str, project_id: str = "default"):
                 e.get("description", ""),
                 project_id=project_id,
             )
+            db.link_entity_to_file(e["name"], file_path)
         
         for r in data.get("relationships", []):
             db.add_relationship(r["source"], r["target"], r["type"])

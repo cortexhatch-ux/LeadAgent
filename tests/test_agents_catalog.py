@@ -33,8 +33,8 @@ class TestCatalogConstants:
     def test_claude_spec_has_npm_package(self):
         assert AGENTS["claude"].npm_pkg == "@anthropic-ai/claude-code"
 
-    def test_grok_has_no_npm_package(self):
-        assert AGENTS["grok"].npm_pkg is None
+    def test_grok_has_npm_package(self):
+        assert AGENTS["grok"].npm_pkg == "@xai-official/grok"
 
 
 # ── _which_extended ──────────────────────────────────────────────────────────
@@ -159,10 +159,6 @@ class TestIsInstalled:
 # ── is_authenticated ─────────────────────────────────────────────────────────
 
 class TestIsAuthenticated:
-    def test_none_for_agent_without_auth_check(self):
-        # grok has no auth_check
-        assert is_authenticated("grok") is None
-
     def test_unknown_agent_returns_none(self):
         assert is_authenticated("skynet") is None
 
