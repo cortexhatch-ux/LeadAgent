@@ -1,8 +1,8 @@
 # LeadAgent: Universal CLI Orchestrator
 
-Route any prompt to Claude, Gemini, or OpenAI from a single terminal command — using your existing subscriptions, with full cross-project memory and zero per-token cost.
+Route any prompt to **Claude**, **Gemini**, **Codex**, or **Grok** from a single terminal command — using your existing subscriptions, with full cross-project memory and zero per-token cost.
 
-> **Not a replacement for Aider, Cursor, or your existing dev tools.** LeadAgent is a "Global Brain" that sits at the OS level, providing shared memory across all your projects.
+> **Latest Release: v0.5.0** — Full support for Codex and Grok, live asynchronous debates, and hardened CLI signal handling.
 
 ## Visual Tour
 
@@ -46,7 +46,7 @@ Send your first prompt:
 ```bash
 # From any project directory
 leadagent "Explain the architecture of this project"
-leadagent "Refactor this module" --agent claude
+leadagent "Refactor this module" --agent codex
 leadagent debate "Microservices vs Monolith for this MVP?"
 ```
 
@@ -75,11 +75,19 @@ leadagent health
 
 ## Why LeadAgent?
 
-- **Zero Marginal Cost** — routes through your existing subscription CLIs, no API keys needed
+- **Zero Marginal Cost** — routes through your existing subscription CLIs (Claude Code, OpenAI Codex, xAI Grok, Google Gemini), no API keys needed
 - **Cross-Project Memory** — local [KuzuDB](http://kuzudb.github.io/docs) graph remembers decisions and history across repos
-- **State-Aware Routing** — task affinity scoring + deterministic fallback DAGs for autonomous recovery
+- **Live Debate Engine** — adversarial multi-agent collaboration with real-time status and umpire synthesis
 - **Privacy-First** — your knowledge graph lives entirely on your machine
 - **Editor Agnostic** — works alongside any IDE via the terminal and MCP interface
+
+## Features in v0.5.0
+
+- **Full Agent Parity**: Robust support for Claude, Gemini, Codex, and Grok.
+- **Async Debate Streaming**: Watch agents argue in real-time with live status updates.
+- **Self-Healing Routing**: Automatic fallback to alternative agents on quota exhaustion or errors.
+- **Enhanced CLI UX**: Full `Ctrl+C` / `Ctrl+Z` support, live reasoning snippets, and dual-port (8000/8001) backend detection.
+- **Memory Hygiene**: Use the new `/forget` command to prune stale project knowledge.
 
 ## How It Works
 
