@@ -62,6 +62,10 @@ class OnboardingManager:
         for key in AGENT_ORDER:
             self._check_agent(key, interactive=interactive)
 
+        # Ollama Model Check (Separate from CLI check)
+        if interactive and "ollama" in AGENT_ORDER:
+            self._check_ollama_model()
+
         print(f"\n{GREEN}{BOLD}✨ Environment synchronization complete.{RESET}")
         print(
             f"  {GRAY}Type {RESET}{BOLD}leadagent health{RESET}{GRAY} to verify live status at any time.{RESET}\n"
@@ -118,7 +122,13 @@ class OnboardingManager:
             and self._ask(f"   {CYAN}Sign in to {spec.display} now? (y/n):{RESET} ")
         ):
             # Docker awareness: if container is running, run login there
-            container_map = {"claude": "leadagent-claude", "gemini": "leadagent-gemini"}
+            container_map = {
+                "claude": "leadagent-claude",
+                "gemini": "leadagent-gemini",
+                "codex": "leadagent-codex",
+                "grok": "leadagent-grok",
+                "ollama": "leadagent-ollama",
+            }
             container = container_map.get(key)
 
             is_docker = False
@@ -150,8 +160,7 @@ class OnboardingManager:
         except EOFError:
             return False
 
-    @staticmethod
-    def _npm_install(package: str):
+    def _npm_install(self, package: str):
         prefix = os.path.expanduser("~/.leadagent")
         try:
             subprocess.run(
@@ -162,6 +171,45 @@ class OnboardingManager:
         except Exception as e:
             print(f"   ⚠️  Install failed: {e}. Run manually:")
             print(f"      npm install -g --prefix {prefix} {package}")
+
+    def _check_ollama_model(self):
+        BOLD = "\033[1m"
+        CYAN = "\033[36m"
+        GREEN = "\033[32m"
+        YELLOW = "\033[33m"
+        RED = "\033[31m"
+        GRAY = "\033[90m"
+        RESET = "\033[0m"
+
+        model = os.environ.get("LEADAGENT_OLLAMA_MODEL", "llama3.2:3b")
+        print(f"\n{BOLD}Step 3: Ollama Intelligence{RESET}")
+        print(f"{GRAY}────────────────────────────────────────────────────────────{RESET}")
+
+        # Check if model exists
+        has_model = False
+        try:
+            if os.environ.get("LEADAGENT_DOCKER_MODE"):
+                res = subprocess.run(
+                    ["docker", "exec", "leadagent-ollama", "ollama", "list"],
+                    capture_output=True, text=True
+                )
+            else:
+                res = subprocess.run(["ollama", "list"], capture_output=True, text=True)
+            
+            if model in res.stdout:
+                has_model = True
+        except:
+            pass
+
+        if has_model:
+            print(f"  {GREEN}● available{RESET}  {BOLD}{model:<18}{RESET} {GRAY}(ready for local routing){RESET}")
+        else:
+            print(f"  {YELLOW}○ missing{RESET}    {BOLD}{model:<18}{RESET} {GRAY}(required for offline classification){RESET}")
+            if self._ask(f"   {CYAN}Pull '{model}' now? (y/n):{RESET} "):
+                if os.environ.get("LEADAGENT_DOCKER_MODE"):
+                    subprocess.run(["docker", "exec", "-it", "leadagent-ollama", "ollama", "pull", model])
+                else:
+                    subprocess.run(["ollama", "pull", model])
 
 
 onboarding = OnboardingManager()

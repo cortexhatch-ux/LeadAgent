@@ -513,6 +513,13 @@ class CLIAgent:
                             if len(cmd) > 60:
                                 cmd = cmd[:57] + "..."
                             yield f"\n__STATUS__:codex → {cmd}\n"
+                    
+                    if etype == "error":
+                        msg = event.get("message") or "Unknown error"
+                        if "login" in msg.lower() or "token" in msg.lower() or "session" in msg.lower():
+                            yield f"\n[Codex Error]: Authentication failed. Please run 'codex login' in your terminal.\n"
+                        else:
+                            yield f"\n[Codex Error]: {msg}\n"
 
                     # 2. Robust text extraction
                     # Only skip high-level boilerplate events that we know don't contain content

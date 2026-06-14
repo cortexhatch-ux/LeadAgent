@@ -173,9 +173,13 @@ def _run_sync(agent_name: str, prompt: str, cwd: str, mode: str = "plan", status
             chunks.append(chunk)
     except Exception as e:
         print(f"[Debate _run_sync] {agent_name} error: {e}")
-        return f"[Agent error: {e}]"
+        raise e
 
-    return "".join(chunks)
+    result = "".join(chunks)
+    if result.startswith("[") and "Error]" in result[:30]:
+        raise Exception(result)
+    
+    return result
 
 
 # ── Main Engine ───────────────────────────────────────────────────────────────

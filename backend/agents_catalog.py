@@ -78,7 +78,7 @@ AGENTS: dict[str, AgentSpec] = {
         vendor="OpenAI",
         color="#5dba6e",
         npm_pkg="@openai/codex",
-        login_cmd="codex login",
+        login_cmd="codex login --device-auth",
         auth_check=["codex", "login", "status"],
     ),
     "grok": AgentSpec(

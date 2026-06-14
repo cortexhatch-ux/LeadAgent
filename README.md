@@ -2,7 +2,7 @@
 
 Route any prompt to **Claude**, **Gemini**, **Codex**, or **Grok** from a single terminal command — using your existing subscriptions, with full cross-project memory and zero per-token cost.
 
-> **Latest Release: v0.5.0** — Full support for Codex and Grok, live asynchronous debates, and hardened CLI signal handling.
+> **Latest Release: v0.5.1** — Hardened debate engine with agent error fallbacks, enhanced Codex/Ollama onboarding, and improved authentication visibility.
 
 ## Visual Tour
 

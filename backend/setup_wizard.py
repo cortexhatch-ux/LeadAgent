@@ -121,7 +121,12 @@ def _tui_wizard():
         authed = is_authenticated(key)
 
         # Docker awareness for TUI
-        container_map = {"claude": "leadagent-claude", "gemini": "leadagent-gemini"}
+        container_map = {
+            "claude": "leadagent-claude",
+            "gemini": "leadagent-gemini",
+            "codex": "leadagent-codex",
+            "grok": "leadagent-grok",
+        }
         container = container_map.get(key)
         is_docker = False
         if container and shutil.which("docker"):
