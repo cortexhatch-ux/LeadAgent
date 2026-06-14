@@ -118,6 +118,16 @@ leadagent --onboarding          # re-run setup wizard
 tail -f leadagent-data/daemon.log
 ```
 
+## Updating
+
+To update to the latest version of LeadAgent:
+
+```bash
+git pull origin main
+./install.sh
+```
+This will automatically rebuild the CLI, refresh your Docker containers, and pull any new local models (like Ollama's Llama 3.2).
+
 ## Slack Bot (Optional)
 
 LeadAgent ships an optional Slack bot that brings `/debate` and `@LeadAgent` mention support directly into your workspace. It is a standalone process — the main backend runs fine without it.
