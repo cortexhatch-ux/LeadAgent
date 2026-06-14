@@ -114,7 +114,10 @@ def _build_argv(
                 _MOUNTED_PREFIXES.append(workspace)
 
             if not any(abs_cwd.startswith(p) for p in _MOUNTED_PREFIXES):
-                abs_cwd = "/tmp"
+                # Fall back to the always-mounted project data dir instead of /tmp.
+                # This gives git-aware CLIs (especially grok) a real .git to work with
+                # instead of triggering git_cli spawn/context failures.
+                abs_cwd = "/app/leadagent-data"
             flags = ["-it"] if tty else []
             return ["docker", "exec"] + flags + ["-w", abs_cwd, container, cli] + args
 
@@ -235,9 +238,10 @@ class CLIAgent:
             return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
 
         if self.command == "grok":
-            # Always include --permission-mode so grok doesn't block waiting for interactive approval
+            # Always include --permission-mode so grok doesn't block waiting for interactive approval.
+            # --no-memory / --no-subagents: LeadAgent drives the session/debate; reduce the CLI's autonomous git worktree + memory behavior.
             grok_mode = {"execute": "auto"}.get(mode, "plan")
-            flags = ["--permission-mode", grok_mode]
+            flags = ["--permission-mode", grok_mode, "--no-memory", "--no-subagents"]
             if not use_stdin:
                 flags += ["-p", prompt]
             return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
@@ -723,9 +727,14 @@ class CLIAgent:
     ) -> Generator[str, None, None]:
         """Run grok with streaming-json output."""
         grok_mode = {"execute": "auto"}.get(mode, "plan")
+        # --no-memory/--no-subagents: we (LeadAgent) control the multi-turn and context for debate/router etc.
+        # This also reduces the CLI's tendency to manage its own git worktrees/sessions, which can
+        # contribute to the git_cli spawn failures when the environment (container) isn't fully git-equipped.
         stream_flags = [
             "--output-format", "streaming-json",
             "--permission-mode", grok_mode,
+            "--no-memory",
+            "--no-subagents",
         ]
 
         prompt_file = None
