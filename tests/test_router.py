@@ -214,6 +214,36 @@ class TestRouteMulti:
             assert isinstance(agents, list)
             assert len(agents) >= 1
 
+    def test_slm_low_complexity_returns_single_agent(self):
+        """SLM recommending multiple agents should be trimmed to one for low complexity."""
+        slm_result = {
+            "task_type": "creative",
+            "complexity": "low",
+            "recommended_agents": ["claude", "gemini"],
+            "mode": "plan",
+        }
+        patches = _mock_route_deps()
+        with patches[0], patches[1], patches[2], \
+             patch("backend.router._classify_task_slm", return_value=slm_result), \
+             patches[4]:
+            agents, meta = AgentRouter().route_multi("creative", "write a short poem")
+            assert len(agents) == 1, f"Expected 1 agent for low complexity, got {agents}"
+
+    def test_slm_high_complexity_allows_fanout(self):
+        """SLM recommending multiple agents should be kept for high complexity."""
+        slm_result = {
+            "task_type": "deep_analysis",
+            "complexity": "high",
+            "recommended_agents": ["claude", "gemini"],
+            "mode": "plan",
+        }
+        patches = _mock_route_deps()
+        with patches[0], patches[1], patches[2], \
+             patch("backend.router._classify_task_slm", return_value=slm_result), \
+             patches[4]:
+            agents, _ = AgentRouter().route_multi("deep_analysis", "analyse the entire codebase architecture")
+            assert len(agents) == 2, f"Expected 2 agents for high complexity, got {agents}"
+
 
 # ── AgentRouter.get_fallback ───────────────────────────────────────────────────
 

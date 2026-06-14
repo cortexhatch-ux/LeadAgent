@@ -309,29 +309,6 @@ async def dashboard():
     return DASHBOARD_HTML
 
 
-@app.get("/v1/roi")
-async def get_roi():
-    """Calculate Return on Investment (success rates) for each agent."""
-    try:
-        # Match all affinity relationships and average the scores per agent
-        rows = db.query_all(
-            "MATCH (t:TaskType)-[r:AFFINITY]->(a:AgentNode) "
-            "RETURN a.name, avg(r.score), sum(r.count)"
-        )
-        # Normalize score (0-1) assuming base affinity is around 0.5
-        # This is a heuristic for visualization
-        roi = {}
-        for name, avg_score, total_count in rows:
-            success_rate = max(0.1, min(1.0, (float(avg_score) + 1.0) / 2.0))
-            roi[name] = {
-                "success_rate": success_rate,
-                "total_tasks": int(total_count)
-            }
-        return roi
-    except Exception:
-        return {}
-
-
 @app.get("/roles")
 async def get_roles():
     return ROLE_DESCRIPTIONS
@@ -492,12 +469,12 @@ def _stream_agent(
 
     agent_done = False
     last_heartbeat = _time.perf_counter()
-    heartbeat_interval = 8   # seconds between status pings when agent is silent
+    heartbeat_interval = 3   # seconds between status pings when agent is silent
     while not agent_done:
         while perm_q is not None:
             try:
                 pr = perm_q.get_nowait()
-                yield f"__PERMISSION_REQUEST__:{json.dumps({'id': pr.id, 'tool_name': pr.tool_name, 'input': pr.input, 'agent': pr.agent})}\n"
+                yield f"\n__PERMISSION_REQUEST__:{json.dumps({'id': pr.id, 'tool_name': pr.tool_name, 'input': pr.input, 'agent': pr.agent})}\n"
             except _queue.Empty:
                 break
 
@@ -516,7 +493,7 @@ def _stream_agent(
                     msg = f"{agent_name} taking longer than usual... ({elapsed}s)"
                 else:
                     msg = f"{agent_name} very slow response — may be rate-limited ({elapsed}s)"
-                yield f"__STATUS__:{msg}\n"
+                yield f"\n__STATUS__:{msg}\n"
             continue
 
         if kind == "done":
@@ -546,7 +523,7 @@ def _stream_agent(
 
             if etype == ErrorType.TRANSIENT_CAPACITY:
                 if fallback:
-                    yield f"__STATUS__:{agent_name} quota exhausted — switching to {fallback}...\n"
+                    yield f"\n__PROGRESS__:⚠️  {agent_name} quota exhausted — switching to {fallback}...\n"
                     yield from _stream_agent(
                         fallback, full_prompt, request, None, tag="fallback", mode=mode
                     )
@@ -573,7 +550,7 @@ def _stream_agent(
 
             # Status markers (tool activity, fallback notices) are UI-only —
             # keep them out of the stored answer and memory.
-            if not chunk.startswith("__STATUS__:"):
+            if not chunk.strip().startswith("__STATUS__:"):
                 response_chunks.append(chunk)
             yield chunk
 
@@ -610,7 +587,7 @@ async def chat(request: ChatRequest):
         return f"\n{s}\n◆  {name.upper()}\n{s}\n"
 
     def _status(msg: str) -> str:
-        return f"__STATUS__:{msg}\n"
+        return f"\n__STATUS__:{msg}\n"
 
     def cli_generator():
         # ── Step 1: memory lookup ──────────────────────────────────────────
@@ -656,8 +633,11 @@ async def chat(request: ChatRequest):
         ):
             yield f"⚠️  {request.preferred_agent} unavailable. Routing to {agent_names[0]}.\n"
 
+        if not is_fanout:
+            yield f"Using CLI Agent: {agent_names[0]}\n"
+
         for agent_name in agent_names:
-            yield f"↳ {agent_router.get_explanation(agent_name, request.prompt)}\n"
+            yield f"\n__PROGRESS__:↳ {agent_router.get_explanation(agent_name, request.prompt)}\n"
 
         perm_q = broker.session_queue(request.session_id)
         result_buf: dict[str, str] = {}
@@ -667,14 +647,21 @@ async def chat(request: ChatRequest):
             # ── Parallel fan-out: run all agents simultaneously, stream in completion order
             done_q: _queue.Queue = _queue.Queue()
 
+            primary_agent = agent_names[0]
+
             def _buffer_one(ag: str) -> None:
                 chunks: list[str] = []
                 t_json = ""
-                # For parallel, we tag each branch uniquely
+                ap = full_prompt if ag == primary_agent else (
+                    "You are the second-opinion agent reviewing this task alongside another agent.\n"
+                    "Provide your perspective and analysis, but do NOT write files or take independent actions — "
+                    "focus on evaluation, alternative approaches, and critique.\n\n"
+                    + full_prompt
+                )
                 for item in _stream_agent(
-                    ag, full_prompt, request, None, tag=f"branch_{ag}", mode=mode
+                    ag, ap, request, None, tag=f"branch_{ag}", mode=mode
                 ):
-                    if item.startswith("\n__TIMING__:"):
+                    if item.strip().startswith("__TIMING__:"):
                         t_json = item
                     else:
                         chunks.append(item)
@@ -697,12 +684,18 @@ async def chat(request: ChatRequest):
             # ── Sequential fan-out
             for i, agent_name in enumerate(agent_names):
                 tag = "primary" if i == 0 else "critic"
+                agent_prompt = full_prompt if i == 0 else (
+                    "You are the second-opinion agent reviewing this task alongside another agent.\n"
+                    "Provide your perspective and analysis, but do NOT write files or take independent actions — "
+                    "focus on evaluation, alternative approaches, and critique.\n\n"
+                    + full_prompt
+                )
                 yield _sep(agent_name)
                 chunks = []
                 for item in _stream_agent(
-                    agent_name, full_prompt, request, perm_q, tag=tag, mode=mode
+                    agent_name, agent_prompt, request, perm_q, tag=tag, mode=mode
                 ):
-                    if not item.startswith("\n__TIMING__:"):
+                    if not item.strip().startswith("__TIMING__:"):
                         yield item
                         chunks.append(item)
                     else:
@@ -738,23 +731,6 @@ async def chat(request: ChatRequest):
         yield f"\n__TIMING__:{json.dumps({'agents': agent_names, 'mode': run_mode, 'memory': _fmt_ms((t1 - t0) * 1000), 'routing': _fmt_ms((t2 - t1) * 1000), 'total': _fmt_ms((_time.perf_counter() - t0) * 1000)})}"
 
     return StreamingResponse(cli_generator(), media_type="text/plain")
-
-
-@app.get("/v1/audit/{session_id}")
-async def get_audit(session_id: str):
-    """Retrieve routing rationale for a given session."""
-    try:
-        # Search the knowledge graph for questions in this session
-        # This is a bit complex without session_id in the Question node (added in earlier steps)
-        rows = db.query_all(
-            "MATCH (q:Question) WHERE q.project_id CONTAINS $sid RETURN q.prompt, q.agent, q.id",
-            {"sid": session_id}
-        )
-        # For simplicity, returning mock rationale if logic is missing
-        # In a real implementation, we'd log routing decisions to a separate table
-        return [{"rationale": {"task_type": "auto", "complexity": "medium", "historical_affinity": 0.8, "known_failure_risks": {}}}]
-    except Exception:
-        return []
 
 
 @app.post("/debate")
@@ -836,6 +812,32 @@ async def get_graph_d3():
             edges.append({"from": src, "to": tgt, "dashes": True, "color": "gray"})
 
     return {"nodes": nodes, "edges": edges}
+
+
+@app.post("/memory/forget")
+async def forget_memory(request: dict):
+    session_id = request.get("session_id", "default")
+    project_id = request.get("project_id", "default")
+    
+    # 1. Invalidate session cache
+    context_cache.invalidate(session_id)
+    
+    # 2. Prune recent extracted entities for this project
+    # We prune entities with type 'extracted' that are recent or have low confidence
+    db.query(
+        "MATCH (e:Entity) WHERE e.type = 'extracted' AND e.project_id = $pid "
+        "DETACH DELETE e",
+        {"pid": project_id}
+    )
+    
+    # 3. Prune recent questions for this project
+    db.query(
+        "MATCH (q:Question) WHERE q.project_id = $pid "
+        "DETACH DELETE q",
+        {"pid": project_id}
+    )
+    
+    return {"status": "success", "message": f"Memory refreshed for project '{project_id}'"}
 
 
 @app.post("/memory/query")
@@ -938,4 +940,7 @@ if __name__ == "__main__":
     # 127.0.0.1 on the host (see docker-compose.yml).
     default_host = "0.0.0.0" if os.environ.get("LEADAGENT_DOCKER_MODE") else "127.0.0.1"
     bind_host = os.environ.get("LEADAGENT_BIND_HOST", default_host)
-    uvicorn.run(app, host=bind_host, port=8000)
+    # Native mode uses 8001 to avoid conflicts with Docker mode (8000)
+    default_port = 8000 if os.environ.get("LEADAGENT_DOCKER_MODE") else 8001
+    bind_port = int(os.environ.get("LEADAGENT_PORT", default_port))
+    uvicorn.run(app, host=bind_host, port=bind_port)

@@ -30,9 +30,9 @@ BACKEND_CONTAINER = "leadagent-backend"
 # True when running inside a Docker container
 IN_DOCKER = os.path.exists("/.dockerenv")
 
-HEALTH_URL = (
-    "http://backend:8000/health" if IN_DOCKER else "http://localhost:8000/health"
-)
+port = 8000 if IN_DOCKER else 8001
+HEALTH_URL = f"http://backend:{port}/health" if IN_DOCKER else f"http://localhost:{port}/health"
+
 AGENTMEMORY_PORT = 3111
 MAX_FAILURES = 3
 DOCKER_SOCK = "/var/run/docker.sock"
@@ -208,12 +208,14 @@ def run_indexer(state: dict):
     indexed_count = 0
 
     # Simple walk-and-hash
+    current_files = set()
     for root, dirs, files in os.walk(workspace):
         # Prune common ignore targets
         dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__', 'venv', 'leadagent')]
 
         for f in files:
             file_path = os.path.join(root, f)
+            current_files.add(file_path)
             ext = os.path.splitext(f)[1].lower()
 
             if ext not in INDEX_EXTENSIONS:
@@ -235,8 +237,16 @@ def run_indexer(state: dict):
         if indexed_count >= 3:
             break
 
-    if indexed_count > 0:
-        log(f"Indexer batch complete: {indexed_count} files processed.")
+    # ── Forgetfulness Engine: Prune deleted files ──
+    deleted_files = [f for f in file_hashes if f not in current_files]
+    for f in deleted_files:
+        log(f"File deleted: {f}, pruning graph...")
+        from backend.db import db
+        db.prune_file(f)
+        del file_hashes[f]
+
+    if indexed_count > 0 or deleted_files:
+        log(f"Indexer batch complete: {indexed_count} indexed, {len(deleted_files)} pruned.")
 
 
 def main():

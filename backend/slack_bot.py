@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 # Load tokens from environment
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
-BACKEND_URL = os.environ.get("LEADAGENT_BACKEND_URL", "http://backend:8000")
+port = 8000 if os.path.exists("/.dockerenv") else 8001
+BACKEND_URL = os.environ.get("LEADAGENT_BACKEND_URL", f"http://backend:{port}")
 
 # Marker prefixes
 PREFIX_ROUND = "__DEBATE_ROUND__"

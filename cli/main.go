@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -45,6 +46,28 @@ type DebateRequest struct {
 	Agents []string `json:"agents,omitempty"`
 	CWD    string   `json:"cwd,omitempty"`
 	Force  bool     `json:"force,omitempty"`
+}
+
+func backendURL() string {
+	// Try default/Docker port first
+	if isPortOpen(8000) {
+		return "http://localhost:8000"
+	}
+	// Try native port second
+	if isPortOpen(8001) {
+		return "http://localhost:8001"
+	}
+	// Fallback to default
+	return "http://localhost:8000"
+}
+
+func isPortOpen(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", port), 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 type ChatResponse struct {
@@ -102,7 +125,7 @@ const (
 // requestCancel holds the cancel func for the currently in-flight HTTP request.
 // SIGINT calls it so the request aborts and the REPL returns to the prompt.
 var (
-	requestCancel func() = func() {}
+	requestCancel func()
 	requestMu     sync.Mutex
 	termMu        sync.Mutex
 )
@@ -116,21 +139,47 @@ func setRequestCancel(cancel func()) {
 func cancelCurrentRequest() {
 	requestMu.Lock()
 	f := requestCancel
-	requestCancel = func() {}
+	requestCancel = nil
 	requestMu.Unlock()
-	f()
+	if f != nil {
+		f()
+	}
 }
 
 // initSigintHandler catches Ctrl+C and cancels the in-flight request instead
-// of killing the process. A second Ctrl+C with no request in flight exits.
+// of killing the process. A second Ctrl+C or one with no request in flight exits.
 func initSigintHandler() {
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTSTP)
+	var lastC int64
+
 	go func() {
-		for range ch {
-			cancelCurrentRequest()
+		for sig := range ch {
+			if sig == syscall.SIGTSTP {
+				// Handle Ctrl+Z: stop the process
+				fmt.Printf("\r%s[stopped]%s\n", Dim+Gray, Reset)
+				signal.Stop(ch)
+				syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+				signal.Notify(ch, os.Interrupt, syscall.SIGTSTP)
+				continue
+			}
+
+			// Handle Ctrl+C
+			requestMu.Lock()
+			f := requestCancel
+			requestCancel = nil
+			requestMu.Unlock()
+
+			now := time.Now().UnixMilli()
+			if f == nil || (now-lastC < 1000) {
+				fmt.Printf("\r%s^C (exiting)%s\n", Dim+Gray, Reset)
+				os.Exit(0)
+			}
+
+			lastC = now
+			f()
 			// Print on a fresh line so the prompt doesn't look garbled.
-			fmt.Printf("\r%s^C%s\n", Dim+Gray, Reset)
+			fmt.Printf("\r%s^C (request cancelled — press again to exit)%s\n", Dim+Gray, Reset)
 		}
 	}()
 }
@@ -478,13 +527,13 @@ func initProject() {
 	cwd, _ := os.Getwd()
 	reqBody := map[string]string{"path": cwd}
 	jsonData, _ := json.Marshal(reqBody)
-	http.Post("http://localhost:8000/project/init", "application/json", bytes.NewBuffer(jsonData))
+	http.Post(backendURL() + "/project/init", "application/json", bytes.NewBuffer(jsonData))
 }
 
 func isBackendUp() bool {
 	// Increased timeout to 2s to account for Docker networking overhead
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://localhost:8000/health")
+	resp, err := client.Get(backendURL() + "/health")
 	if err != nil {
 		return false
 	}
@@ -556,6 +605,7 @@ type inputModel struct {
 	result      string
 	submitted   bool
 	interrupted bool
+	stopped     bool
 	width       int
 }
 
@@ -617,6 +667,10 @@ func (m inputModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			m.interrupted = true
+			return m, tea.Quit
+
+		case tea.KeyCtrlZ:
+			m.stopped = true
 			return m, tea.Quit
 
 		case tea.KeyEnter:
@@ -729,6 +783,11 @@ func readInput(agent, role string, history []string) (string, error) {
 	if fm.interrupted {
 		return "", ErrInterrupted
 	}
+	if fm.stopped {
+		fmt.Printf("\r%s[stopped]%s\n", Dim+Gray, Reset)
+		syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+		return readInput(agent, role, history)
+	}
 	if fm.submitted {
 		return fm.result, nil
 	}
@@ -779,11 +838,33 @@ func startREPL() {
 			fmt.Printf(" %s/health%s                Show daemon health & agent availability\n", Cyan, Reset)
 			fmt.Printf(" %s/doctor%s                Run full environment diagnostic\n", Cyan, Reset)
 			fmt.Printf(" %s/debate [--rounds N] [--no-context] <topic>%s  Multi-agent debate\n", Cyan, Reset)
+			fmt.Printf(" %s/forget%s                Clear stale project knowledge & cache\n", Cyan, Reset)
 			fmt.Printf(" %s(nc) <msg>%s             Run query without project context\n", Cyan, Reset)
 			fmt.Printf(" %s<agent> <msg>%s          One-message agent switch (e.g. 'gemini explain this')\n", Cyan, Reset)
 			fmt.Printf(" %sboth/compare/vs <agents> <msg>%s  Fan-out to multiple agents\n", Cyan, Reset)
 			fmt.Printf(" %s/help%s                  Show this message\n", Cyan, Reset)
 			fmt.Printf(" %sexit%s                   Close the session\n\n", Cyan, Reset)
+			continue
+		}
+
+		if trimmed == "/forget" {
+			projectID := filepath.Base(findProjectRoot())
+			reqBody := map[string]string{
+				"session_id": sessionID,
+				"project_id": projectID,
+			}
+			jsonData, _ := json.Marshal(reqBody)
+			resp, err := http.Post(backendURL() + "/memory/forget", "application/json", bytes.NewBuffer(jsonData))
+			if err != nil {
+				fmt.Printf("\n%s❌ Error connecting to LeadAgent daemon: %v%s\n", Red, err, Reset)
+				continue
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == 200 {
+				fmt.Printf("\n%s✨ Project memory and session cache refreshed.%s\n", Green, Reset)
+			} else {
+				fmt.Printf("\n%s❌ Failed to refresh memory (HTTP %d)%s\n", Red, resp.StatusCode, Reset)
+			}
 			continue
 		}
 
@@ -926,7 +1007,7 @@ func drawDashboard() {
 	client := &http.Client{Timeout: 2 * time.Second}
 	var health HealthResponse
 	backendOnline := false
-	resp, err := client.Get("http://localhost:8000/health")
+	resp, err := client.Get(backendURL() + "/health")
 	if err == nil {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
@@ -1029,7 +1110,7 @@ func getAgentColor(agent string) string {
 }
 
 func printRoles() {
-	resp, err := http.Get("http://localhost:8000/roles")
+	resp, err := http.Get(backendURL() + "/roles")
 	if err != nil {
 		fmt.Printf("%s  Could not fetch roles from daemon.%s\n\n", Red, Reset)
 		return
@@ -1231,7 +1312,7 @@ func (kl *keyListener) Close() {
 func postInterrupt(sessionID string) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	client.Post(
-		fmt.Sprintf("http://localhost:8000/permission/interrupt/%s", sessionID),
+		fmt.Sprintf(backendURL() + "/permission/interrupt/%s", sessionID),
 		"application/json", nil,
 	)
 }
@@ -1380,7 +1461,7 @@ func handlePermissionRequest(rawJSON string, getKey func() byte) {
 	decJSON, _ := json.Marshal(decBody)
 	client := &http.Client{Timeout: 5 * time.Second}
 	client.Post(
-		fmt.Sprintf("http://localhost:8000/permission/%s/decide", pr.ID),
+		fmt.Sprintf(backendURL() + "/permission/%s/decide", pr.ID),
 		"application/json",
 		bytes.NewBuffer(decJSON),
 	)
@@ -1408,10 +1489,10 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 	setRequestCancel(cancel)
 	defer func() {
 		cancel()
-		setRequestCancel(func() {})
+		setRequestCancel(nil)
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost:8000/chat", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, backendURL() + "/chat", bytes.NewBuffer(jsonData))
 	if err != nil {
 		stopSpinner()
 		fmt.Printf("%s  Error building request: %v%s\n", Red, err, Reset)
@@ -1503,19 +1584,56 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 				// Status update from backend — update spinner label, never print
 				if strings.HasPrefix(trimmed, "__STATUS__:") {
 					msg := strings.TrimPrefix(trimmed, "__STATUS__:")
-					if !spinnerStopped {
-						updateSpinner(msg)
+					if spinnerStopped {
+						stopSpinner, updateSpinner = startSpinner(agentName)
+						spinnerStopped = false
 					}
+					updateSpinner(msg)
 					continue
 				}
 
-				if !spinnerStopped && strings.HasPrefix(line, "Using CLI Agent:") {
+				// Dedicated progress info — print live, never buffer
+				if strings.HasPrefix(trimmed, "__PROGRESS__:") {
+					msg := strings.TrimPrefix(trimmed, "__PROGRESS__:")
+					if !spinnerStopped {
+						stopSpinner()
+						spinnerStopped = true
+					}
+
+					// Detect automatic agent switch (Self-Healing)
+					if strings.Contains(msg, "switching to ") {
+						parts := strings.Split(msg, "switching to ")
+						if len(parts) == 2 {
+							target := strings.Trim(parts[1], ". ")
+							if target != "" {
+								agentName = target
+								// Spinner will be restarted by next __STATUS__ or line
+							}
+						}
+					}
+
+					if !progressHeaderShown {
+						color := getAgentColor(agentName)
+						label := agentName
+						if label == "" {
+							label = "agent"
+						}
+						fmt.Printf("\n%s%s%s %s%s%s\n", Dim+Gray, "  ", color+Bold, strings.ToUpper(label), Reset+Dim+Gray+" processing...", Reset)
+						progressHeaderShown = true
+					}
+					printLiveProgress(msg)
+					continue
+				}
+
+				if strings.HasPrefix(line, "Using CLI Agent:") {
 					parts := strings.SplitN(line, ":", 2)
 					if len(parts) == 2 {
 						agentName = strings.Fields(strings.TrimSpace(parts[1]))[0]
 						currentBlock.name = agentName
 					}
-					stopSpinner()
+					if !spinnerStopped {
+						stopSpinner()
+					}
 					stopSpinner, updateSpinner = startSpinner(agentName)
 					spinnerStopped = false
 					continue
@@ -1652,9 +1770,26 @@ func sendDebate(prompt string, rounds int, agents []string, cwd string, force bo
 	}
 	jsonData, _ := json.Marshal(reqBody)
 
-	client := &http.Client{Timeout: 0}
-	resp, err := client.Post("http://localhost:8000/debate", "application/json", bytes.NewBuffer(jsonData))
+	ctx, cancel := context.WithCancel(context.Background())
+	setRequestCancel(cancel)
+	defer func() {
+		cancel()
+		setRequestCancel(nil)
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, backendURL() + "/debate", bytes.NewBuffer(jsonData))
 	if err != nil {
+		fmt.Printf("%s❌ Error building debate request: %v%s\n", Red, err, Reset)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Printf("%s  Debate cancelled.%s\n", Yellow, Reset)
+			return
+		}
 		fmt.Printf("%s❌ Could not reach debate endpoint: %v%s\n", Red, err, Reset)
 		return
 	}
@@ -1687,6 +1822,7 @@ func sendDebate(prompt string, rounds int, agents []string, cwd string, force bo
 	currentAgent := ""
 	var currentBlock agentBlock
 	var umpireBuf strings.Builder
+	var updateSpinner func(string)
 	stopSpin := func() {}
 	spinRunning := false
 
@@ -1737,6 +1873,26 @@ func sendDebate(prompt string, rounds int, agents []string, cwd string, force bo
 				continue
 			}
 
+			if strings.HasPrefix(t, "__STATUS__:") {
+				msg := strings.TrimPrefix(t, "__STATUS__:")
+				if !spinRunning {
+					stopSpin, updateSpinner = startSpinner(currentAgent)
+					spinRunning = true
+				}
+				updateSpinner(msg)
+				continue
+			}
+
+			if strings.HasPrefix(t, "__PROGRESS__:") {
+				msg := strings.TrimPrefix(t, "__PROGRESS__:")
+				if !spinRunning {
+					stopSpin, updateSpinner = startSpinner(currentAgent)
+					spinRunning = true
+				}
+				updateSpinner(msg)
+				continue
+			}
+
 			if t == markerUmpire {
 				flushBlock()
 				inUmpire = true
@@ -1744,7 +1900,7 @@ func sendDebate(prompt string, rounds int, agents []string, cwd string, force bo
 					stopSpin()
 					spinRunning = false
 				}
-				stopSpin, _ = startSpinner("umpire")
+				stopSpin, updateSpinner = startSpinner("umpire")
 				spinRunning = true
 				continue
 			}
@@ -1776,7 +1932,7 @@ func sendDebate(prompt string, rounds int, agents []string, cwd string, force bo
 				if spinRunning {
 					stopSpin()
 				}
-				stopSpin, _ = startSpinner(currentAgent)
+				stopSpin, updateSpinner = startSpinner(currentAgent)
 				spinRunning = true
 				continue
 			}
@@ -1838,7 +1994,7 @@ func statusDot(ok bool) string {
 }
 
 func handleHealth() {
-	resp, err := http.Get("http://localhost:8000/health")
+	resp, err := http.Get(backendURL() + "/health")
 	if err != nil {
 		fmt.Printf("\n%s%s┌─────────────────────────────────────────┐%s\n", Bold, Cyan, Reset)
 		fmt.Printf("%s%s│         %s⚠️  SYSTEM OFFLINE             %s%s│%s\n", Bold, Cyan, Yellow, Bold, Cyan, Reset)
@@ -1971,7 +2127,7 @@ func handleDoctor() {
 
 	// Backend-side full doctor.
 	client := &http.Client{Timeout: 6 * time.Second}
-	resp, err := client.Get("http://localhost:8000/doctor")
+	resp, err := client.Get(backendURL() + "/doctor")
 	if err != nil {
 		printDoctorRow("backend", false, "offline — start with ./start_backend.sh")
 		fmt.Printf("%s%s╰────────────────────────────────────────────╯%s\n\n", Bold, Cyan, Reset)
@@ -2027,7 +2183,7 @@ func handleQuery(cypher string) {
 	reqBody := map[string]string{"cypher": cypher}
 	jsonData, _ := json.Marshal(reqBody)
 
-	resp, err := http.Post("http://localhost:8000/memory/query", "application/json", bytes.NewBuffer(jsonData))
+	resp, err := http.Post(backendURL() + "/memory/query", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return

@@ -68,6 +68,7 @@ services:
       - leadagent-net
     volumes:
       - .:/app/leadagent-data
+      - ${HOME}/.codex:/home/node/.codex
       # Mirror host projects path
       - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     restart: unless-stopped
@@ -87,6 +88,7 @@ services:
       - leadagent-net
     volumes:
       - .:/app/leadagent-data
+      - ${HOME}/.grok/auth.json:/home/node/.grok/auth.json:ro
       # Mirror host projects path
       - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     restart: unless-stopped

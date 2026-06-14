@@ -77,8 +77,13 @@ stop_native_service() {
 }
 
 if wants backend; then
-    echo "🧹 Stopping backend (port 8000)..."
-    stop_native_service 8000 "main.py"
+    if [ "$FORCE_NATIVE" = true ] || ! docker info &>/dev/null; then
+        echo "🧹 Stopping native backend (port 8001)..."
+        stop_native_service 8001 "main.py"
+    else
+        echo "🧹 Stopping Docker backend (port 8000)..."
+        stop_native_service 8000 "main.py"
+    fi
 fi
 if wants agentmemory; then
     echo "🧹 Stopping agentmemory (port 3111)..."

@@ -121,25 +121,86 @@ class TestExecuteStreamNonClaude:
             with pytest.raises(Exception):
                 list(agent.execute_stream("hi", session_id="s1"))
 
-    def test_returncode_one_does_not_raise(self):
-        # returncode=1 is explicitly tolerated on the standard path
+    def test_returncode_one_with_result_event_does_not_raise(self):
+        # returncode=1 is tolerated when the CLI emitted a success result event
         agent = CLIAgent("grok")
-        proc = self._fake_process([], returncode=1)
+        result_line = json.dumps({"type": "end", "stopReason": "EndTurn", "is_error": False}) + "\n"
+        proc = self._fake_process([result_line], returncode=1)
         with patch("subprocess.Popen", return_value=proc):
             list(agent.execute_stream("hi", session_id="s1"))
 
-    def test_codex_returncode_not_checked(self):
-        # codex uses _execute_jsonl_stream which has no returncode check
+    def test_returncode_one_no_result_raises(self):
+        # returncode=1 with no result event is a crash — should raise
+        agent = CLIAgent("grok")
+        proc = self._fake_process([], returncode=1)
+        with patch("subprocess.Popen", return_value=proc):
+            with pytest.raises(Exception, match="exit code 1"):
+                list(agent.execute_stream("hi", session_id="s1"))
+
+    def test_codex_returncode_now_checked(self):
+        # codex uses _execute_jsonl_stream which now has a returncode check
         agent = CLIAgent("codex")
         proc = self._fake_process([], returncode=2)
         with patch("subprocess.Popen", return_value=proc):
-            list(agent.execute_stream("hi", session_id="s1"))  # no exception
+            with pytest.raises(Exception, match="failed with exit code 2"):
+                list(agent.execute_stream("hi", session_id="s1"))
+
+    def test_grok_streaming_parsing(self):
+        agent = CLIAgent("grok")
+        events = [
+            json.dumps({"type": "thought", "data": "Reasoning..."}) + "\n",
+            json.dumps({"type": "text", "data": "Hello "}) + "\n",
+            json.dumps({"type": "text", "data": "world!"}) + "\n",
+            json.dumps({"type": "end", "stopReason": "EndTurn"}) + "\n",
+        ]
+        proc = self._fake_process(events, returncode=0)
+        with patch("subprocess.Popen", return_value=proc):
+            chunks = list(agent.execute_stream("hi", session_id="s1"))
+        assert chunks == ["Hello ", "world!"]
+
+    def test_grok_error_handling(self):
+        agent = CLIAgent("grok")
+        events = [
+            json.dumps({"type": "end", "stopReason": "Error", "error": "Internal Fail"}) + "\n",
+        ]
+        proc = self._fake_process(events, returncode=0)
+        with patch("subprocess.Popen", return_value=proc):
+            with pytest.raises(Exception, match="Internal Fail"):
+                list(agent.execute_stream("hi", session_id="s1"))
 
     def test_zero_returncode_no_exception(self):
         agent = CLIAgent("gemini")
         proc = self._fake_process(["ok\n"], returncode=0)
         with patch("subprocess.Popen", return_value=proc):
-            list(agent.execute_stream("hi", session_id="s1"))  # no exception
+            list(agent.execute_stream("hi", session_id="s1"))
+
+    def test_codex_streaming_parsing(self):
+        agent = CLIAgent("codex")
+        events = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "ls"}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "ls"}}) + "\n",
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Done"}}) + "\n",
+            json.dumps({"type": "turn.completed"}) + "\n",
+        ]
+        proc = self._fake_process(events, returncode=0)
+        with patch("subprocess.Popen", return_value=proc):
+            chunks = list(agent.execute_stream("hi", session_id="s1"))
+        
+        # Should include status update and final text
+        assert "__STATUS__:codex → ls" in chunks[0]
+        assert "Done" in chunks[1]
+
+    def test_codex_fallback_parsing(self):
+        # Ensure generic JSONL agents still work with recursive search
+        agent = CLIAgent("codex")
+        events = [
+            json.dumps({"random": "event", "text": "fallback"}) + "\n",
+        ]
+        proc = self._fake_process(events, returncode=0)
+        with patch("subprocess.Popen", return_value=proc):
+            chunks = list(agent.execute_stream("hi", session_id="s1"))
+        assert chunks == ["fallback"]
 
     def test_large_prompt_uses_stdin(self):
         agent = CLIAgent("codex")

@@ -115,9 +115,13 @@ def _build_argv(
 
             if not any(abs_cwd.startswith(p) for p in _MOUNTED_PREFIXES):
                 abs_cwd = "/tmp"
-            flags = ["-it"] if tty else ["-i"]
+            flags = ["-it"] if tty else []
             return ["docker", "exec"] + flags + ["-w", abs_cwd, container, cli] + args
-    return [cli] + args
+
+    # Native mode: Resolve full path to binary to avoid Errno 2
+    from backend.agents_catalog import _which_extended
+    binary = _which_extended(cli) or cli
+    return [binary] + args
 
 
 def _allowed_cwd_roots() -> list[str]:
@@ -134,6 +138,17 @@ def _allowed_cwd_roots() -> list[str]:
     extra = os.environ.get("LEADAGENT_ALLOWED_CWD", "")
     roots.extend(p for p in extra.split(":") if p)
     return [os.path.realpath(r) for r in roots]
+
+
+def _write_to_stdin(process, data):
+    """Write data to process.stdin in a separate thread to avoid deadlocks."""
+    try:
+        if process.stdin:
+            process.stdin.write(data)
+            process.stdin.close()
+    except Exception:
+        # Silently fail if the process exited or pipe closed early
+        pass
 
 
 def _tool_status_hint(tool_input: Any) -> str:
@@ -219,12 +234,22 @@ class CLIAgent:
                 flags = ["-p", prompt]
             return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
 
-        if self.command == "grok" or self.command not in ("claude", "gemini", "codex"):
-            flags = ["--print"]
+        if self.command == "grok":
+            # Always include --permission-mode so grok doesn't block waiting for interactive approval
+            grok_mode = {"execute": "auto"}.get(mode, "plan")
+            flags = ["--permission-mode", grok_mode]
             if not use_stdin:
-                flags = ["--print", prompt]
+                flags += ["-p", prompt]
             return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
-            
+
+        if self.command == "codex":
+            # Use dangerously-bypass-approvals-and-sandbox to fix Docker bwrap issue
+            # without requiring dangerous SYS_ADMIN capability.
+            flags = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
+            if not use_stdin:
+                flags.append(prompt)
+            return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
+
         return [], None, False
 
     def execute_stream(
@@ -235,6 +260,10 @@ class CLIAgent:
         simple: bool = False,
         mode: str = "plan",
     ) -> Generator[str, None, None]:
+        # Validation: Check if the CLI/binary exists before dispatching
+        if not is_installed_anywhere(self.command):
+            raise Exception(f"AGENT_NOT_FOUND: '{self.command}' CLI is not installed locally and no container is running. Run './install.sh' or use the onboarding wizard to enable it.")
+
         if self.command == "ollama":
             # Ollama uses a REST API, not Popen
             from backend.agents import OllamaAgent
@@ -245,6 +274,12 @@ class CLIAgent:
             yield from self._execute_claude_stream(prompt, cwd, session_id, len(prompt) > _ARG_MAX, mode)
             return
 
+        if self.command == "grok":
+            # Always use the streaming path — grok needs --permission-mode to be non-interactive
+            # regardless of whether debate's simple=True flag is set.
+            yield from self._execute_grok_stream(prompt, cwd, session_id, len(prompt) > _ARG_MAX, mode)
+            return
+
         if self.command == "codex":
             # By default run Codex in a workspace-scoped sandbox with no
             # interactive approvals — it can edit files in its cwd but cannot
@@ -252,12 +287,12 @@ class CLIAgent:
             # (host + network access, no approvals) is opt-in because, combined
             # with prompt injection, it is a host-takeover primitive.
             if os.environ.get("LEADAGENT_ALLOW_UNSANDBOXED"):
-                flags = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
+                flags = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
             else:
                 flags = [
                     "exec", "--json",
                     "--sandbox", "workspace-write",
-                    "--ask-for-approval", "never",
+                    "--skip-git-repo-check",
                 ]
             use_stdin = len(prompt) > _ARG_MAX
             if not use_stdin:
@@ -298,11 +333,10 @@ class CLIAgent:
 
         threading.Thread(target=_log_stderr, daemon=True).start()
 
-        try:
-            if use_stdin and stdin_data:
-                process.stdin.write(stdin_data)
-                process.stdin.close()
+        if use_stdin and stdin_data:
+            threading.Thread(target=_write_to_stdin, args=(process, stdin_data), daemon=True).start()
 
+        try:
             for raw_line in process.stdout:
                 line = _ANSI_RE.sub("", raw_line)
                 stripped = line.strip()
@@ -358,11 +392,11 @@ class CLIAgent:
 
             threading.Thread(target=_log_stderr, daemon=True).start()
 
+            if use_stdin and stdin_data:
+                threading.Thread(target=_write_to_stdin, args=(process, stdin_data), daemon=True).start()
+
             quota_hit = False
             try:
-                if use_stdin and stdin_data:
-                    process.stdin.write(stdin_data)
-                    process.stdin.close()
                 for raw_line in process.stdout:
                     line = _ANSI_RE.sub("", raw_line)
                     stripped = line.strip()
@@ -394,7 +428,7 @@ class CLIAgent:
             if next_model is None and i + 1 >= len(_GEMINI_MODEL_LADDER):
                 raise Exception("AGENT_TRANSIENT_ERROR")
             label = next_model or "default model"
-            yield f"__STATUS__:Gemini quota exhausted — retrying with {label}...\n"
+            yield f"\n__STATUS__:Gemini quota exhausted — retrying with {label}...\n"
 
         raise Exception("AGENT_TRANSIENT_ERROR")
 
@@ -403,36 +437,30 @@ class CLIAgent:
     ) -> Generator[str, None, None]:
         """Generic JSONL event stream parser (used by Codex and others)."""
 
-        def find_text(obj: Any) -> Generator[str, None, None]:
-            """Recursively find any 'text' or 'content' fields in the JSON event."""
-            if isinstance(obj, dict):
-                # 1. Check for known text fields
-                if "text" in obj and isinstance(obj["text"], str):
-                    yield obj["text"]
-                elif "content" in obj and isinstance(obj["content"], str):
-                    yield obj["content"]
-                # 2. Check for Claude-style text deltas
-                elif obj.get("type") == "text_delta" and "text" in obj:
-                    yield obj["text"]
-                # 3. Recurse into all other fields
-                else:
-                    for val in obj.values():
-                        yield from find_text(val)
+        def find_text(obj: Any, is_content_field: bool = False) -> Generator[str, None, None]:
+            """Recursively find 'text', 'content', 'delta', or 'aggregated_output' fields."""
+            if isinstance(obj, str):
+                if obj and is_content_field:
+                    yield obj
+            elif isinstance(obj, dict):
+                for key, val in obj.items():
+                    # If this key is one of our blessed content fields, or we are already
+                    # inside one (e.g. a list inside 'content'), then is_content_field is True.
+                    is_content = key in ("text", "content", "delta", "aggregated_output")
+                    yield from find_text(val, is_content_field=is_content or is_content_field)
             elif isinstance(obj, list):
                 for item in obj:
-                    yield from find_text(item)
+                    yield from find_text(item, is_content_field=is_content_field)
 
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
         env.setdefault("COLORTERM", "truecolor")
 
         local_cwd = _safe_cwd(cwd)
-        # Only pipe stdin if we actually have data to send.
-        # Otherwise, some CLIs (like codex) might hang waiting for input.
         process = subprocess.Popen(
             command_args,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,  # Silence CLI noise (like "Reading from stdin...")
+            stderr=subprocess.PIPE,
             stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
             text=True,
             bufsize=0,
@@ -441,19 +469,27 @@ class CLIAgent:
             start_new_session=True,
         )
 
-        try:
-            if stdin_data:
-                process.stdin.write(stdin_data)
-                process.stdin.close()
+        stderr_tail: list[str] = []
 
+        def _log_stderr():
+            for line in process.stderr:
+                if line.strip():
+                    print(f"[{self.command} CLI Stderr]: {line.strip()}")
+                    stderr_tail.append(line.strip())
+                    del stderr_tail[:-20]
+
+        threading.Thread(target=_log_stderr, daemon=True).start()
+
+        if stdin_data:
+            threading.Thread(target=_write_to_stdin, args=(process, stdin_data), daemon=True).start()
+
+        try:
             for raw_line in process.stdout:
                 raw = raw_line.rstrip("\n")
                 if not raw:
                     continue
 
-                # Check if it's JSONL. If not (e.g. a startup warning), skip it.
                 if not raw.startswith("{"):
-                    # Still check for suppression list even for non-JSON lines
                     stripped = raw.strip()
                     if stripped and not any(
                         stripped.startswith(p) for p in _SUPPRESS_PREFIXES
@@ -463,7 +499,22 @@ class CLIAgent:
 
                 try:
                     event = json.loads(raw)
-                    yield from find_text(event)
+                    etype = event.get("type")
+
+                    # 1. Specific status updates for Codex
+                    if etype == "item.started":
+                        item = event.get("item", {})
+                        if item.get("type") == "command_execution":
+                            cmd = item.get("command", "command")
+                            if len(cmd) > 60:
+                                cmd = cmd[:57] + "..."
+                            yield f"\n__STATUS__:codex → {cmd}\n"
+
+                    # 2. Robust text extraction
+                    # Only skip high-level boilerplate events that we know don't contain content
+                    if etype not in ("turn.started", "turn.completed", "thread.started"):
+                        yield from find_text(event)
+
                 except json.JSONDecodeError:
                     continue
 
@@ -472,11 +523,19 @@ class CLIAgent:
             if process.poll() is None:
                 process.terminate()
 
+        if process.returncode not in (0, None, 1):
+            detail = f"{self.command} failed with exit code {process.returncode}"
+            if stderr_tail:
+                detail += ". Stderr: " + " / ".join(stderr_tail[-5:])
+            raise Exception(detail)
+
     def _execute_claude_stream(
         self, prompt: str, cwd: str, session_id: str, use_stdin: bool, mode: str = "plan"
     ) -> Generator[str, None, None]:
         """Run claude with stream-json output and MCP permission tool."""
-        backend_url = "http://leadagent-backend:8000" if os.environ.get("LEADAGENT_DOCKER_MODE") else "http://localhost:8000"
+        # Use the configured port (default 8000 for Docker, 8001 for native)
+        port = int(os.environ.get("LEADAGENT_PORT", 8000 if os.environ.get("LEADAGENT_DOCKER_MODE") else 8001))
+        backend_url = f"http://leadagent-backend:{port}" if os.environ.get("LEADAGENT_DOCKER_MODE") else f"http://localhost:{port}"
         
         # Use python3 as the command in containers, sys.executable locally
         python_cmd = "python3" if os.environ.get("LEADAGENT_DOCKER_MODE") else sys.executable
@@ -574,12 +633,11 @@ class CLIAgent:
 
         threading.Thread(target=_log_stderr, daemon=True).start()
 
+        if stdin_data:
+            threading.Thread(target=_write_to_stdin, args=(process, stdin_data), daemon=True).start()
+
         saw_result = False
         try:
-            if use_stdin and stdin_data:
-                process.stdin.write(stdin_data)
-                process.stdin.close()
-
             for raw_line in process.stdout:
                 raw = raw_line.rstrip("\n")
                 if not raw:
@@ -606,7 +664,7 @@ class CLIAgent:
                         elif item.get("type") == "tool_use":
                             name = item.get("name", "tool")
                             hint = _tool_status_hint(item.get("input"))
-                            yield f"__STATUS__:claude → {name}{hint}\n"
+                            yield f"\n__STATUS__:claude → {name}{hint}\n"
                 elif etype == "content_block_delta":
                     # Streaming token delta
                     delta = event.get("delta", {})
@@ -657,6 +715,166 @@ class CLIAgent:
                 detail += ". Stderr: " + " / ".join(stderr_tail[-5:])
             low = detail.lower()
             if "rate limit" in low or "overloaded" in low or "529" in low:
+                raise Exception("AGENT_TRANSIENT_ERROR")
+            raise Exception(detail)
+
+    def _execute_grok_stream(
+        self, prompt: str, cwd: str, session_id: str, use_stdin: bool, mode: str = "plan"
+    ) -> Generator[str, None, None]:
+        """Run grok with streaming-json output."""
+        grok_mode = {"execute": "auto"}.get(mode, "plan")
+        stream_flags = [
+            "--output-format", "streaming-json",
+            "--permission-mode", grok_mode,
+        ]
+
+        prompt_file = None
+        if use_stdin:
+            # Grok doesn't support stdin, so we use a temp file for large prompts.
+            # In Docker mode, this MUST be in a mounted volume (like _PROJECT_ROOT).
+            fd, prompt_file = tempfile.mkstemp(
+                suffix=".txt", 
+                prefix="grok_prompt_",
+                dir=_PROJECT_ROOT
+            )
+            os.chmod(prompt_file, 0o644)  # Ensure Docker agent user can read it
+            with os.fdopen(fd, "w") as f:
+                f.write(prompt)
+            command_args = _build_argv("grok", ["--prompt-file", prompt_file] + stream_flags, cwd=cwd)
+            stdin_data = None
+        else:
+            command_args = _build_argv("grok", ["-p", prompt] + stream_flags, cwd=cwd)
+            stdin_data = None
+
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+
+        local_cwd = _safe_cwd(cwd)
+        process = subprocess.Popen(
+            command_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
+            text=True,
+            bufsize=0,
+            cwd=local_cwd,
+            env=env,
+            start_new_session=True,
+        )
+
+        stderr_tail: list[str] = []
+
+        def _log_stderr():
+            for line in process.stderr:
+                if line.strip():
+                    print(f"[Grok CLI Stderr]: {line.strip()}")
+                    stderr_tail.append(line.strip())
+                    del stderr_tail[:-20]
+
+        threading.Thread(target=_log_stderr, daemon=True).start()
+
+        if stdin_data:
+            threading.Thread(target=_write_to_stdin, args=(process, stdin_data), daemon=True).start()
+
+        saw_result = False
+        reasoning_buffer = []
+        try:
+            for raw_line in process.stdout:
+                raw = raw_line.rstrip("\n")
+                if not raw:
+                    continue
+
+                if not raw.startswith("{"):
+                    stripped = raw.strip()
+                    if stripped and not any(
+                        stripped.startswith(p) for p in _SUPPRESS_PREFIXES
+                    ):
+                        yield raw_line
+                    continue
+
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    if raw.strip():
+                        # Still yield invalid JSON if it looks like content
+                        if not any(raw.strip().startswith(p) for p in _SUPPRESS_PREFIXES):
+                            yield raw_line
+                    continue
+
+                etype = event.get("type")
+                
+                # 1. Capture internal reasoning as STATUS (updates the spinner area)
+                if etype == "thought":
+                    data = event.get("data", "")
+                    if data:
+                        reasoning_buffer.append(data)
+                        # Every ~5 tokens or so, update the spinner with the tail of the reasoning
+                        if len(reasoning_buffer) % 5 == 0:
+                            # Join the last few tokens to show progress
+                            tail = "".join(reasoning_buffer[-10:]).replace("\n", " ").strip()
+                            if len(tail) > 40:
+                                tail = "..." + tail[-37:]
+                            yield f"\n__STATUS__:grok thinking: {tail}\n"
+                    continue
+
+                if etype == "tool_use":
+                    name = event.get("name", "tool")
+                    hint = _tool_status_hint(event.get("input"))
+                    yield f"\n__STATUS__:grok → {name}{hint}\n"
+                    continue
+
+                if etype == "end":
+                    saw_result = True
+                    stop_reason = event.get("stopReason")
+                    if event.get("is_error") or stop_reason not in (None, "EndTurn", "end_turn"):
+                        err = str(event.get("error") or stop_reason or "unknown")
+                        if stderr_tail:
+                            err += " | stderr: " + " / ".join(stderr_tail[-5:])
+                        low = err.lower()
+                        if "rate limit" in low or "quota" in low or "429" in low:
+                            raise Exception("AGENT_TRANSIENT_ERROR")
+                        raise Exception(f"Grok stopped unexpectedly: {err}")
+                    continue
+
+                # 2. Robust, context-aware extraction for everything else
+                def find_grok_content(obj: Any, is_content: bool = False) -> Generator[str, None, None]:
+                    if isinstance(obj, str):
+                        if obj and is_content:
+                            yield obj
+                    elif isinstance(obj, dict):
+                        for key, val in obj.items():
+                            # Only yield if inside a 'content' key (data, text, content, delta)
+                            # to avoid technical keys like 'item_id' or 'requestId' leaking.
+                            is_now_content = is_content or key in ("data", "text", "content", "delta")
+                            yield from find_grok_content(val, is_now_content)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            yield from find_grok_content(item, is_content)
+
+                yield from find_grok_content(event)
+
+        except Exception as e:
+            if str(e) != "AGENT_TRANSIENT_ERROR":
+                print(f"[_execute_grok_stream] Exception: {e}")
+            raise e
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait()
+            if prompt_file:
+                try:
+                    os.remove(prompt_file)
+                except OSError:
+                    pass
+
+        if process.returncode not in (0, None) and not (
+            process.returncode == 1 and saw_result
+        ):
+            detail = f"Grok failed with exit code {process.returncode}"
+            if stderr_tail:
+                detail += ". Stderr: " + " / ".join(stderr_tail[-5:])
+            low = detail.lower()
+            if "rate limit" in low or "quota" in low or "429" in low:
                 raise Exception("AGENT_TRANSIENT_ERROR")
             raise Exception(detail)
 

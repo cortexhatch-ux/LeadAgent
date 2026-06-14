@@ -85,7 +85,7 @@ class TestRunSync:
             _run_sync("claude", "p", "/tmp")
         kwargs = fake_agent.execute_stream.call_args.kwargs
         assert kwargs.get("session_id") == "debate"
-        assert kwargs.get("simple") is False
+        assert kwargs.get("simple") is True
 
 
 # ── run_debate ───────────────────────────────────────────────────────────────
@@ -255,7 +255,10 @@ class TestRunDebate:
             patch("backend.debate.enabled_agents", return_value={"claude"}),
             patch("backend.debate._run_sync", return_value="synthesised"),
             patch("backend.debate.memory_client.store", side_effect=lambda **kw: store_calls.append(kw)),
-            patch("backend.debate.db.add_question", side_effect=lambda *a: question_calls.append(a) or "qid-1"),
+            patch(
+                "backend.debate.db.add_question",
+                side_effect=lambda *a, **kw: question_calls.append((a, kw)) or "qid-1",
+            ),
             patch("backend.debate.db.add_entity"),
             patch("backend.debate.db.link_question_to_entity"),
         ):
@@ -264,4 +267,5 @@ class TestRunDebate:
         # Memory store called for synthesis
         assert any(c.get("tier") == "episodic" for c in store_calls)
         # Question stored with DEBATE prefix
-        assert any("[DEBATE]" in c[0] for c in question_calls)
+        assert any("[DEBATE]" in args[0] for args, _ in question_calls)
+        assert any(kwargs.get("error_sourced") is False for _, kwargs in question_calls)
