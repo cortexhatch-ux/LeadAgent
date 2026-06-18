@@ -16,15 +16,13 @@ _PROJECT_ROOT = str(Path(__file__).parent.parent.absolute())
 
 # Gemini model fallback ladder — tried in order when quota is exhausted
 _GEMINI_MODEL_LADDER = [
-    None,                    # default (no -m flag) = Gemini 2.5 Pro
-    "gemini-2.0-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
+    None,                    # default (no --model flag) = Gemini 3.5 Flash
+    "Gemini 3.1 Pro",
 ]
 
 _CLI_MAP = {
     "claude": "claude",
-    "gemini": "gemini",
+    "gemini": "agy",
     "codex": "codex",
     "grok": "grok",
 }
@@ -53,7 +51,7 @@ def _container_running(container: str) -> bool:
         return False
 
 
-def is_installed_anywhere(cli: str) -> bool:
+def is_installed_anywhere(cli: str, agent_key: str | None = None) -> bool:
     """Check if CLI is installed locally OR if its container is running in Docker mode."""
     if cli == "ollama":
         from backend.agents import OllamaAgent
@@ -67,7 +65,7 @@ def is_installed_anywhere(cli: str) -> bool:
             pass
 
     if os.environ.get("LEADAGENT_DOCKER_MODE"):
-        container = _CONTAINER_MAP.get(cli)
+        container = _CONTAINER_MAP.get(agent_key or cli)
         if container:
             return _container_running(container)
 
@@ -87,7 +85,7 @@ def is_installed_anywhere(cli: str) -> bool:
 
 
 def _build_argv(
-    cli: str, args: list[str], cwd: str = ".", tty: bool = False
+    cli: str, args: list[str], cwd: str = ".", tty: bool = False, agent_key: str | None = None
 ) -> list[str]:
     """
     Return the command argv to run `cli args`.
@@ -98,7 +96,7 @@ def _build_argv(
     Leave tty=False for subprocess.Popen calls (no outer TTY).
     """
     if os.environ.get("LEADAGENT_DOCKER_MODE") and shutil.which("docker"):
-        container = _CONTAINER_MAP.get(cli)
+        container = _CONTAINER_MAP.get(agent_key or cli)
         if container and _container_running(container):
             # Pass working directory to the container so it sees the same files.
             abs_cwd = cwd
@@ -210,26 +208,24 @@ _SUPPRESS_PREFIXES = (
 
 
 class CLIAgent:
-    def __init__(self, command: str):
+    def __init__(self, command: str, agent_key: str | None = None):
         self.command = command
+        self.agent_key = agent_key or command
 
     def _build_popen_args(self, prompt: str, cwd: str, mode: str, gemini_model: str | None = None) -> tuple[list[str], str | None, bool]:
         """Return (args, stdin_data, use_stdin)."""
         use_stdin = len(prompt) > _ARG_MAX
         stdin_data = prompt if use_stdin else None
 
-        if self.command == "gemini":
-            # Map LeadAgent internal modes to Gemini's --approval-mode values:
-            #   "execute" → "yolo"    (auto-approve all, structural rules still enforce)
-            #   "plan"    → "default" (LeadAgent "plan" = ask before acting, NOT Gemini read-only)
-            #   anything else → "default"
-            gemini_mode = {"execute": "yolo"}.get(mode, "default")
-            flags = ["--skip-trust", "--approval-mode", gemini_mode]
+        if self.command == "agy":
+            flags = []
+            if mode == "execute":
+                flags.append("--dangerously-skip-permissions")
             if gemini_model:
-                flags = ["-m", gemini_model] + flags
+                flags += ["--model", gemini_model]
             if not use_stdin:
-                flags = ["-p", prompt] + flags
-            return _build_argv(self.command, flags, cwd=cwd), stdin_data, use_stdin
+                flags += ["-p", prompt]
+            return _build_argv(self.command, flags, cwd=cwd, agent_key=self.agent_key), stdin_data, use_stdin
 
         if self.command == "claude":
             flags = ["-p"]
@@ -265,7 +261,7 @@ class CLIAgent:
         mode: str = "plan",
     ) -> Generator[str, None, None]:
         # Validation: Check if the CLI/binary exists before dispatching
-        if not is_installed_anywhere(self.command):
+        if not is_installed_anywhere(self.command, agent_key=self.agent_key):
             raise Exception(f"AGENT_NOT_FOUND: '{self.command}' CLI is not installed locally and no container is running. Run './install.sh' or use the onboarding wizard to enable it.")
 
         if self.command == "ollama":
@@ -305,7 +301,7 @@ class CLIAgent:
             yield from self._execute_jsonl_stream(command_args, prompt if use_stdin else None, cwd)
             return
 
-        if self.command == "gemini":
+        if self.command == "agy":
             yield from self._execute_gemini_with_fallback(prompt, cwd, mode)
             return
 
@@ -944,7 +940,7 @@ class AgentFactory:
         if agent_name == "ollama":
             return OllamaAgent()
         if agent_name in _CLI_MAP:
-            return CLIAgent(_CLI_MAP[agent_name])
+            return CLIAgent(_CLI_MAP[agent_name], agent_key=agent_name)
         raise ValueError(f"Unknown agent: {agent_name}")
 
 

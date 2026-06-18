@@ -142,7 +142,7 @@ class ContextScraper:
                 f"Context:\n{text}"
             )
 
-            cmd = _build_argv("gemini", ["-p", prompt, "--skip-trust"])
+            cmd = _build_argv("agy", ["-p", prompt])
             process = subprocess.run(cmd, capture_output=True, text=True)
 
             output = process.stdout.strip()
