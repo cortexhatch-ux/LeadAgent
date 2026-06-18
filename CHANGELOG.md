@@ -2,6 +2,16 @@
 
 All notable changes to LeadAgent will be documented in this file.
 
+## [0.6.0] - 2026-06-18
+
+### Breaking Changes
+- **Gemini CLI replaced by Antigravity (`agy`):** Google deprecated the `@google/gemini-cli` npm package and OAuth sign-in for individuals. LeadAgent now uses the `agy` CLI from [antigravity.google](https://antigravity.google). Run `curl -fsSL https://antigravity.google/cli/install.sh | bash` to install, then re-run onboarding.
+
+### Changed
+- **Docker:** `leadagent-gemini` container rebuilt with `agy` instead of `gemini`. Re-run `docker compose build gemini-agent` after upgrading.
+- **Model ladder:** Updated fallback models to Gemini 3.5 Flash → Gemini 3.1 Pro (matching `agy`'s available models).
+- **Auth check:** Gemini availability and auth detection now probe `agy --version` instead of `gemini --version`.
+
 ## [0.5.1] - 2026-06-14
 
 ### Added

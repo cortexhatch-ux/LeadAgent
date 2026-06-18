@@ -25,10 +25,10 @@ class GeminiScraper(BaseScraper):
         return "gemini"
 
     def scrape(self) -> dict:
-        if not _PEXPECT_AVAILABLE or not is_installed_anywhere("gemini"):
+        if not _PEXPECT_AVAILABLE or not is_installed_anywhere("agy"):
             return {}
         try:
-            argv = _build_argv("gemini", [], tty=True)
+            argv = _build_argv("agy", [], tty=True)
             child = pexpect.spawn(
                 argv[0],
                 args=argv[1:],

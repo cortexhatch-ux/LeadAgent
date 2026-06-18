@@ -358,7 +358,7 @@ func runSetupWizard() {
 	cmd.Run()
 }
 
-var version = "0.5.1"
+var version = "0.6.0"
 
 func printVersion() {
 	rev, dirty := "", ""

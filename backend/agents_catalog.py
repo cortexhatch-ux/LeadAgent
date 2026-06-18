@@ -65,12 +65,12 @@ AGENTS: dict[str, AgentSpec] = {
     ),
     "gemini": AgentSpec(
         key="gemini",
-        display="Gemini Advanced",
+        display="Gemini (Antigravity)",
         vendor="Google",
         color="#5e9cf5",
-        npm_pkg="@google/gemini-cli",
-        login_cmd="gemini auth login",
-        auth_check=["gemini", "--version"],
+        install_cmd="curl -fsSL https://antigravity.google/cli/install.sh | bash",
+        login_cmd="agy",
+        auth_check=["agy", "--version"],
     ),
     "codex": AgentSpec(
         key="codex",
@@ -112,6 +112,16 @@ _EXTRA_BIN_DIRS = [
     "/opt/homebrew/bin",
     "/usr/local/bin",
 ]
+
+
+_AGENT_CLI_MAP = {
+    "gemini": "agy",
+}
+
+
+def _resolve_cli(agent_key: str) -> str:
+    """Return the actual CLI binary name for an agent key."""
+    return _AGENT_CLI_MAP.get(agent_key, agent_key)
 
 
 def _which_extended(cmd: str) -> Optional[str]:
@@ -168,7 +178,7 @@ def is_installed(agent_key: str) -> bool:
     if os.environ.get("LEADAGENT_DOCKER_MODE"):
         if _container_running(agent_key):
             return True
-    return _which_extended(agent_key) is not None
+    return _which_extended(_resolve_cli(agent_key)) is not None
 
 
 def enabled_agents() -> set[str]:
@@ -203,7 +213,7 @@ def is_authenticated(agent_key: str) -> Optional[bool]:
         }
         cmd = ["docker", "exec", "-i", container_map[agent_key]] + spec.auth_check
     else:
-        binary = _which_extended(agent_key) or agent_key
+        binary = _which_extended(_resolve_cli(agent_key)) or _resolve_cli(agent_key)
         cmd = [binary] + spec.auth_check[1:]
 
     try:
