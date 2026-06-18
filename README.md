@@ -2,7 +2,7 @@
 
 Route any prompt to **Claude**, **Gemini**, **Codex**, or **Grok** from a single terminal command — using your existing subscriptions, with full cross-project memory and zero per-token cost.
 
-> **Latest Release: v0.5.1** — Hardened debate engine with agent error fallbacks, enhanced Codex/Ollama onboarding, and improved authentication visibility.
+> **Latest Release: v0.6.0** — Migrated Gemini integration from the deprecated `gemini-cli` to Google's new Antigravity CLI (`agy`). Breaking change: re-run onboarding and rebuild the Gemini container after upgrading.
 
 ## Visual Tour
 
@@ -24,7 +24,7 @@ Route any prompt to **Claude**, **Gemini**, **Codex**, or **Grok** from a single
 
 ## Quick Start
 
-Requires Python 3.10+, Go 1.25+, and at least one AI provider CLI (`claude` or `gemini`).
+Requires Python 3.10+, Go 1.25+, and at least one AI provider CLI (`claude` or `agy`).
 
 ```bash
 git clone https://github.com/your-username/LeadAgent.git
@@ -75,19 +75,20 @@ leadagent health
 
 ## Why LeadAgent?
 
-- **Zero Marginal Cost** — routes through your existing subscription CLIs (Claude Code, OpenAI Codex, xAI Grok, Google Gemini), no API keys needed
+- **Zero Marginal Cost** — routes through your existing subscription CLIs (Claude Code, OpenAI Codex, xAI Grok, Google Antigravity/Gemini), no API keys needed
 - **Cross-Project Memory** — local [KuzuDB](http://kuzudb.github.io/docs) graph remembers decisions and history across repos
 - **Live Debate Engine** — adversarial multi-agent collaboration with real-time status and umpire synthesis
 - **Privacy-First** — your knowledge graph lives entirely on your machine
 - **Editor Agnostic** — works alongside any IDE via the terminal and MCP interface
 
-## Features in v0.5.0
+## Features in v0.6.0
 
-- **Full Agent Parity**: Robust support for Claude, Gemini, Codex, and Grok.
+- **Antigravity (agy) Integration**: Gemini now routes through Google's new `agy` CLI — supports Gemini 3.5 Flash and 3.1 Pro with automatic model fallback.
+- **Full Agent Parity**: Robust support for Claude, Gemini (via `agy`), Codex, and Grok.
 - **Async Debate Streaming**: Watch agents argue in real-time with live status updates.
 - **Self-Healing Routing**: Automatic fallback to alternative agents on quota exhaustion or errors.
 - **Enhanced CLI UX**: Full `Ctrl+C` / `Ctrl+Z` support, live reasoning snippets, and dual-port (8000/8001) backend detection.
-- **Memory Hygiene**: Use the new `/forget` command to prune stale project knowledge.
+- **Memory Hygiene**: Use the `/forget` command to prune stale project knowledge.
 
 ## How It Works
 
@@ -127,6 +128,22 @@ git pull origin main
 ./install.sh
 ```
 This will automatically rebuild the CLI, refresh your Docker containers, and pull any new local models (like Ollama's Llama 3.2).
+
+### Upgrading to v0.6.0 (breaking change)
+
+Google deprecated `@google/gemini-cli`. LeadAgent now uses the Antigravity CLI (`agy`):
+
+```bash
+# 1. Install agy on your host
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+
+# 2. Rebuild the Gemini container
+docker compose build gemini-agent
+docker compose up -d gemini-agent
+
+# 3. Re-run onboarding to authenticate
+leadagent --onboarding
+```
 
 ## Slack Bot (Optional)
 
