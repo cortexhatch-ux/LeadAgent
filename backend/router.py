@@ -1,11 +1,38 @@
+import logging
 import re
 import json
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from backend.db import db
 from backend.memory_client import memory_client
 from backend.context_cache import context_cache
 from backend.agents_catalog import enabled_agents, is_authenticated
+from backend.security import is_blocked_entity
+
+# _ENTITY_BLOCKLIST lives in security.py — use is_blocked_entity() instead.
+
+# ── Sensitivity Classification (Provenance-Aware Export Guards) ──────────────
+_SENSITIVE_PATTERN = re.compile(
+    r"(?i)"
+    r"/Users/[\w.-]+/"             # Local user paths
+    r"|/home/[\w.-]+/"              # Linux home paths
+    r"|[a-zA-Z]:\\[Uu]sers\\"        # Windows user paths
+    r"|\b[\w.-]+\.local\b"           # .local hostnames
+    r"|\b[\w.-]+\.internal\b"        # .internal hostnames
+    r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}" # Private IP Class A
+    r"|192\.168\.\d{1,3}\.\d{1,3}"   # Private IP Class C
+    r"|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}" # Private IP Class B
+)
+
+
+def _is_sensitive(text: str) -> bool:
+    """Heuristic to check if an entity looks like private infrastructure or identifiers."""
+    return bool(_SENSITIVE_PATTERN.search(text))
+
+
+_PROMPT_MAX_CHARS = 8000  # Truncate before any regex/brain work
 
 # All agents are subscription CLIs
 _CLI_MAP = {
@@ -82,19 +109,47 @@ def _classify_task_slm(prompt: str) -> Optional[dict]:
     from backend.agents import agent_factory
     try:
         ollama = agent_factory.get_agent("ollama")
-        routing_prompt = f"""
-Analyze the following user prompt and categorize it for multi-agent routing.
-Respond ONLY with a JSON object in this format:
+        routing_prompt = f"""You are a routing engine. Read the user request and decide which AI agent(s) to call.
+
+Respond ONLY with a valid JSON object — no markdown, no explanation outside the JSON.
+
 {{
   "task_type": "coding" | "research" | "deep_analysis" | "long_context" | "creative" | "logic" | "general",
   "complexity": "low" | "medium" | "high",
   "mode": "plan" | "execute",
-  "recommended_agents": ["claude", "gemini", "codex", "grok"],
-  "explanation": "short reason",
-  "parallel": true | false
+  "recommended_agents": ["<agent>"],
+  "multi_agent_explicit": false,
+  "explanation": "<one sentence>"
 }}
 
-Prompt: {prompt}
+AGENT SELECTION RULES — read carefully:
+
+1. DEFAULT: always recommend exactly ONE agent.
+2. Only recommend TWO agents when the user EXPLICITLY asks for comparison, a second opinion, debate, or multiple perspectives. This means words like "compare X and Y", "get both claude and gemini", "debate this", "second opinion". NOT just because the task is hard.
+3. NEVER recommend more than two agents. NEVER recommend all agents.
+4. Set "multi_agent_explicit": true ONLY when rule 2 applies — the user literally asked for multiple agents.
+
+AGENT STRENGTHS:
+- claude: coding, logic, nuanced analysis, architecture
+- gemini: research, long documents, summarization
+- codex: pure code generation, refactoring
+- grok: creative writing, general questions, quick lookups
+
+COMPLEXITY RULES:
+- low: single factual question, quick lookup, short task
+- medium: moderate coding task, multi-step explanation
+- high: large refactor, multi-system architecture, deep security audit
+
+EXAMPLES:
+- "how does X work?" → 1 agent (gemini or grok), low complexity
+- "fix this bug in my code" → 1 agent (claude or codex), medium complexity
+- "compare claude vs gemini on this problem" → 2 agents, multi_agent_explicit: true
+- "install all the dependencies" → 1 agent, this is NOT a multi-agent request
+- "what are all the files in the project?" → 1 agent, "all" here is not about agents
+- "give me a second opinion on this architecture" → 2 agents, multi_agent_explicit: true
+- "write a complex distributed system with auth, DB, and API" → 1 agent (claude), high complexity — hard task does NOT mean fan-out
+
+User request: {prompt}
 """
         response = ""
         for chunk in ollama.execute_stream(routing_prompt, simple=True):
@@ -188,55 +243,157 @@ Output your plan as a structured "INTERNAL REASONING" block.
         delta = 0.1 if success else -0.2
         db.update_affinity(task_type, agent, delta)
 
-    def check_memory(self, prompt: str, session_id: str = "default") -> Optional[str]:
+    def check_memory(
+        self,
+        prompt: str,
+        session_id: str = "default",
+        project_id: str = "default",
+        memory_scope: str = "shared",
+    ) -> Optional[str]:
+        prompt = prompt[:_PROMPT_MAX_CHARS]
         # ── Semantic memory ───────────────────────────────────────────────────
-        semantic_results = memory_client.search(prompt, limit=3)
-        all_snippets = (
-            [r["content"] for r in semantic_results] if semantic_results else []
-        )
+        sem_project = None if memory_scope == "global" else project_id
+        semantic_results = memory_client.search(prompt, limit=3, project_id=sem_project, strict=(memory_scope == "strict"))
+        all_snippets = []
+        for r in (semantic_results or []):
+            content = (
+                r.get("content")
+                or r.get("observation", {}).get("narrative")
+                or r.get("observation", {}).get("title")
+                or ""
+            )
+            if content:
+                all_snippets.append(content)
         new_snippets = context_cache.filter_memory(session_id, all_snippets)
 
+        # ── Project-ID scoping ────────────────────────────────────────────────
+        # "strict"  → only this project
+        # "shared"  → this project OR the global "default" pool (backward compat)
+        # "global"  → no filter (admin / single-project setups)
+        if memory_scope == "strict":
+            pid_clause = "AND e.project_id = $pid "
+            pid_params: dict = {"pid": project_id}
+        elif memory_scope == "shared":
+            # Global pool entities require confidence >= 0.7 to filter out auto-extracted noise.
+            pid_clause = "AND (e.project_id = $pid OR (e.project_id = 'default' AND e.confidence >= 0.7)) "
+            pid_params = {"pid": project_id}
+        else:  # global
+            pid_clause = ""
+            pid_params = {}
+
         # ── Graph: matched entities ───────────────────────────────────────────
+        # Export Guard: Return project_id to filter sensitive data from cross-project sources
         all_entity_rows = db.query_all(
-            "MATCH (e:Entity) WHERE lower($prompt) CONTAINS lower(e.name) RETURN e.name, e.type, e.description",
-            {"prompt": prompt},
+            "MATCH (e:Entity) WHERE lower($prompt) CONTAINS lower(e.name) "
+            + pid_clause
+            + "RETURN e.name, e.type, e.description, e.project_id",
+            {"prompt": prompt, **pid_params},
         )
-        new_entity_rows = context_cache.filter_entities(session_id, all_entity_rows)
+
+        # Export guard: enforce project isolation as a defence-in-depth layer
+        # even if the DB query returns cross-project rows unexpectedly.
+        filtered_entity_rows = []
+        for row in all_entity_rows:
+            e_name, e_type, e_desc, e_pid = row
+            if e_pid != project_id and project_id != "default":
+                # strict: reject all cross-project entities unconditionally
+                if memory_scope == "strict":
+                    continue
+                # shared: allow 'default' pool only; reject all other projects
+                if e_pid != "default":
+                    continue
+                # shared + default pool: still filter sensitive names
+                if _is_sensitive(e_name) or _is_sensitive(e_desc or ""):
+                    continue
+            filtered_entity_rows.append((e_name, e_type, e_desc))
+
+        new_entity_rows = context_cache.filter_entities(session_id, filtered_entity_rows)
         entity_names = [
-            row[0] for row in all_entity_rows
-        ]  # all — for relationship + QA lookup
-        {row[0] for row in new_entity_rows}
+            row[0] for row in filtered_entity_rows
+        ]  # filtered — for relationship + QA lookup
 
         # ── Graph: 1-hop relationships (batched) ───────────────
         all_rel_rows = []
         if entity_names:
+            if memory_scope == "strict":
+                rel_pid_clause = "AND a.project_id = $pid AND b.project_id = $pid "
+            elif memory_scope == "shared":
+                rel_pid_clause = (
+                    "AND (a.project_id = $pid OR a.project_id = 'default') "
+                    "AND (b.project_id = $pid OR b.project_id = 'default') "
+                )
+            else:
+                rel_pid_clause = ""
             all_rel_rows = db.query_all(
                 "MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) "
                 "WHERE a.name IN $names "
-                "RETURN a.name, b.name, b.type, b.description, r.type",
-                {"names": entity_names},
+                + rel_pid_clause
+                + "RETURN a.name, b.name, b.type, b.description, r.type, b.project_id",
+                {"names": entity_names, **pid_params},
             )
-        new_rel_rows = context_cache.filter_relations(session_id, all_rel_rows)
+
+        # Apply export guard to relationships
+        filtered_rel_rows = []
+        for r in all_rel_rows:
+            if r[5] != project_id and project_id != "default":
+                if _is_sensitive(r[1]) or _is_sensitive(r[3] or ""):
+                    continue
+            filtered_rel_rows.append(r[:5])
+
+        new_rel_rows = context_cache.filter_relations(session_id, filtered_rel_rows)
 
         # ── Graph: past Q&A (batched) ───────────────────────────
         all_qa_rows = []
         if entity_names:
+            # Build qa_pid_clause independently — Question nodes have no confidence field.
+            if memory_scope == "strict":
+                qa_pid_clause = "AND q.project_id = $pid "
+            elif memory_scope == "shared":
+                qa_pid_clause = "AND (q.project_id = $pid OR q.project_id = 'default') "
+            else:
+                qa_pid_clause = ""
             all_qa_rows = db.query_all(
                 "MATCH (q:Question)-[:ABOUT]->(e:Entity) "
                 "WHERE e.name IN $names "
-                "RETURN q.prompt, q.answer, q.agent ORDER BY q.timestamp DESC LIMIT 10",
-                {"names": entity_names},
+                + qa_pid_clause
+                + "RETURN q.prompt, q.answer, q.agent, q.project_id ORDER BY q.timestamp DESC LIMIT 10",
+                {"names": entity_names, **pid_params},
             )
-        new_qa_rows = context_cache.filter_qa(session_id, all_qa_rows)
+
+        # Apply export guard to QA
+        filtered_qa_rows = []
+        for r in all_qa_rows:
+            if r[3] != project_id and project_id != "default":
+                if _is_sensitive(r[0]) or _is_sensitive(r[1]):
+                    continue
+            filtered_qa_rows.append(r[:3])
+
+        new_qa_rows = context_cache.filter_qa(session_id, filtered_qa_rows)
 
         # ── Graph: Filesystem structure (keyword match on path/name) ─────────
+        if memory_scope == "strict":
+            file_pid_clause = "AND f.project_id = $pid "
+        elif memory_scope == "shared":
+            file_pid_clause = "AND (f.project_id = $pid OR f.project_id = 'default') "
+        else:
+            file_pid_clause = ""
         all_file_rows = db.query_all(
-            "MATCH (f:File) WHERE $prompt CONTAINS f.name OR $prompt CONTAINS f.path "
-            "RETURN f.path, f.name, f.extension LIMIT 5",
-            {"prompt": prompt},
+            "MATCH (f:File) WHERE ($prompt CONTAINS f.name OR $prompt CONTAINS f.path) "
+            + file_pid_clause
+            + "RETURN f.path, f.name, f.extension, f.project_id LIMIT 5",
+            {"prompt": prompt, **pid_params},
         )
+        
+        # Apply export guard to files
+        filtered_file_rows = []
+        for r in all_file_rows:
+            if r[3] != project_id and project_id != "default":
+                if _is_sensitive(r[0]) or _is_sensitive(r[1]):
+                    continue
+            filtered_file_rows.append(r[:3])
+
         new_file_rows = context_cache.filter_entities(
-            session_id + ":files", all_file_rows
+            session_id + ":files", filtered_file_rows
         )
 
         # ── Build context blocks from new-only items ──────────────────────────
@@ -278,11 +435,11 @@ Output your plan as a structured "INTERNAL REASONING" block.
         )
 
         skipped = (
-            len(all_entity_rows)
+            len(filtered_entity_rows)
             - len(new_entity_rows)
-            + len(all_rel_rows)
+            + len(filtered_rel_rows)
             - len(new_rel_rows)
-            + len(all_qa_rows)
+            + len(filtered_qa_rows)
             - len(new_qa_rows)
             + len(all_snippets)
             - len(new_snippets)
@@ -310,33 +467,46 @@ Output your plan as a structured "INTERNAL REASONING" block.
             return inner
         return prompt.strip()
 
-    def learn_from_prompt(self, prompt: str, answer: str, agent: str):
+    def learn_from_prompt(self, prompt: str, answer: str, agent: str, project_id: str = "default", session_id: str = "default"):
         """
         Extract entities from a completed Q&A via regex heuristics.
         No LLM call — zero quota spend for bookkeeping.
         """
         prompt = self._extract_user_prompt(prompt)
+        prompt = prompt[:_PROMPT_MAX_CHARS]
+        answer = answer[:_PROMPT_MAX_CHARS]
         try:
-            text = f"{prompt} {answer}"
-            technical = set(
-                re.findall(
-                    r"\b[A-Z][a-zA-Z]{2,}\b"  # CamelCase identifiers
-                    r"|\b\w+\.(?:py|js|go|ts|json|yaml)\b"  # filenames
-                    r"|\b[a-z]+_[a-z_]{2,}\b",  # snake_case names
-                    text,
+            # Always store the question for history; skip entity graph pollution for un-scoped prompts
+            qid = db.add_question(prompt, answer[:500], agent, source_project_id=project_id, session_id=session_id)
+
+            if project_id != "default":
+                text = f"{prompt} {answer}"
+                technical = set(
+                    re.findall(
+                        r"\b[A-Z][a-zA-Z]{2,}\b"  # CamelCase identifiers
+                        r"|\b\w+\.(?:py|js|go|ts|json|yaml)\b"  # filenames
+                        r"|\b[a-z]+_[a-z_]{2,}\b",  # snake_case names
+                        text,
+                    )
                 )
+                entities = [
+                    t for t in technical
+                    if 3 < len(t) < 60 and not is_blocked_entity(t)
+                ][:50]
+
+                for name in entities:
+                    db.add_entity(name, "extracted", "", source_project_id=project_id, auto_extracted=True, source_agent=agent)
+                    db.link_question_to_entity(qid, name, project_id=project_id)
+
+            # Distil Q&A pair into semantic memory so it's retrievable across sessions
+            memory_client.store(
+                content=f"Q: {prompt}\nA: {answer[:400]}",
+                metadata={"agent": agent, "project_id": project_id, "session_id": session_id, "type": "qa"},
+                tier="semantic",
             )
-            entities = [t for t in technical if 3 < len(t) < 60][:50]
-
-            # Store the question first to get a stable ID
-            qid = db.add_question(prompt, answer[:500], agent)
-
-            for name in entities:
-                db.add_entity(name, "extracted", "")
-                db.link_question_to_entity(qid, name)
 
         except Exception as e:
-            print(f"[learn_from_prompt] {e}")
+            logger.warning("[learn_from_prompt] %s", e)
 
     _KNOWN_AGENTS = ("claude", "gemini", "codex", "grok")
 
@@ -413,17 +583,21 @@ Output your plan as a structured "INTERNAL REASONING" block.
         if preferred_agent and preferred_agent in available:
             return [preferred_agent], {"mode": _detect_execute_mode(prompt)}
 
+        user_msg = self._extract_user_prompt(prompt) if prompt else ""
         if prompt:
-            inferred = self._infer_agents_from_prompt(prompt)
+            # Strip conversation history — only match agent intent in the actual user message.
+            # Running regex on full history causes false fan-out when prior turns name agents.
+            inferred = self._infer_agents_from_prompt(user_msg)
             valid = [a for a in inferred if a in available]
             if valid:
                 # If the user named exactly one agent, stick to it (no double billing)
                 if len(valid) == 1:
-                    return valid, {"mode": _detect_execute_mode(prompt), "force_single": True}
-                return valid, {"mode": _detect_execute_mode(prompt)}
+                    return valid, {"mode": _detect_execute_mode(prompt), "force_single": True, "routing_reason": "explicit"}
+                return valid, {"mode": _detect_execute_mode(prompt), "routing_reason": "explicit"}
 
         # ── Tier 0: SLM-based routing (Ollama) ──
-        slm_decision = _classify_task_slm(prompt) if prompt else None
+        # Pass only the clean user message — not full history — so Ollama sees intent, not noise.
+        slm_decision = _classify_task_slm(user_msg) if prompt else None
         if slm_decision:
             task_type = slm_decision.get("task_type", task_type)
             complexity = slm_decision.get("complexity", "low")
@@ -431,16 +605,21 @@ Output your plan as a structured "INTERNAL REASONING" block.
                 a for a in slm_decision.get("recommended_agents", []) if a in available
             ]
             if recommended:
-                # Only fan-out on high complexity; trim to single agent otherwise
-                if complexity != "high" and len(recommended) > 1:
+                # Fan-out only when Ollama explicitly confirmed the user asked for multiple agents.
+                # Hard tasks, high complexity, or agent names appearing elsewhere do NOT qualify.
+                multi_explicit = slm_decision.get("multi_agent_explicit", False)
+                if not multi_explicit:
                     recommended = recommended[:1]
-                # For high complexity, generate internal reasoning block
+                # Hard cap: never more than 2 regardless of what Ollama says
+                recommended = recommended[:2]
+                # For high complexity single-agent tasks, generate internal reasoning block
                 if complexity == "high":
-                    reasoning = self._reason_task_slm(prompt)
+                    reasoning = self._reason_task_slm(user_msg)
                     if reasoning:
                         slm_decision["internal_reasoning"] = reasoning
                 # Deterministic override: never trust Ollama's mode for file-edit tasks
                 slm_decision["mode"] = _detect_execute_mode(prompt)
+                slm_decision["routing_reason"] = "slm"
                 return recommended, slm_decision
 
         if task_type == "general" and prompt:
@@ -451,21 +630,30 @@ Output your plan as a structured "INTERNAL REASONING" block.
         # ── Tier 1: Affinity-based routing (Learned) ─────────────────────────
         best_affinity = self._get_best_affinity_agent(task_type, available)
         if best_affinity:
-            # Check if this task warrants adversarial review (Consensus Round 3)
-            # Only add a critic if the user didn't ask for a specific agent
-            if (task_type in ("deep_analysis", "logic") or complexity == "high") and not preferred_agent:
-                # For high complexity, add a second agent to critique
+            # Add a critic only when the prompt is substantive enough to warrant it:
+            # - task type suggests deep work, AND
+            # - prompt is long enough to be a real analysis request (not a follow-up), AND
+            # - keyword signal is strong (best_n > 3 avoids short prompts that weakly match)
+            _, complexity_n = _classify_task(prompt)
+            task_signal = sum(len(p.findall(prompt)) for p in _TASK_PATTERNS.values())
+            wants_critic = (
+                not preferred_agent
+                and (task_type in ("deep_analysis", "logic") or complexity == "high")
+                and len(prompt) > 150
+                and task_signal > 3
+            )
+            if wants_critic:
                 critics = [a for a in available if a != best_affinity]
                 if critics:
-                    return [best_affinity, critics[0]], {"complexity": complexity, "mode": _detect_execute_mode(prompt)}
-            return [best_affinity], {"complexity": complexity, "mode": _detect_execute_mode(prompt)}
+                    return [best_affinity, critics[0]], {"complexity": complexity, "mode": _detect_execute_mode(prompt), "routing_reason": "affinity+critic"}
+            return [best_affinity], {"complexity": complexity, "mode": _detect_execute_mode(prompt), "routing_reason": "affinity"}
 
         # ── Tier 2: Strength-based routing (Static fallback) ─────────────────
         for agent in available:
             if task_type in self.strengths.get(agent, []):
-                return [agent], {"complexity": complexity, "mode": _detect_execute_mode(prompt)}
+                return [agent], {"complexity": complexity, "mode": _detect_execute_mode(prompt), "routing_reason": "strength"}
 
-        return [available[0]], {"complexity": complexity, "mode": _detect_execute_mode(prompt)}
+        return [available[0]], {"complexity": complexity, "mode": _detect_execute_mode(prompt), "routing_reason": "default"}
 
     def get_explanation(self, agent: str, prompt: str) -> str:
         task_type, complexity = _classify_task(prompt)

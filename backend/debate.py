@@ -10,9 +10,12 @@ Round flow:
   Synthesis → each agent declares consensus / still disputes / changed mind
 """
 
+import os
 import re
 import queue
 import time as _time
+
+from backend.security import is_blocked_entity
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from typing import Iterator, Any
 
@@ -176,9 +179,12 @@ def _run_sync(agent_name: str, prompt: str, cwd: str, mode: str = "plan", status
         raise e
 
     result = "".join(chunks)
-    if result.startswith("[") and "Error]" in result[:30]:
-        raise Exception(result)
-    
+    stripped = result.strip()
+    if "[Ollama Error]" in stripped or ("Model '" in stripped and "not found" in stripped):
+        raise Exception(stripped)
+    if stripped.startswith("[") and "Error]" in stripped[:30]:
+        raise Exception(stripped)
+
     return result
 
 
@@ -186,7 +192,7 @@ def _run_sync(agent_name: str, prompt: str, cwd: str, mode: str = "plan", status
 
 
 def run_debate(
-    prompt: str, rounds: int = 3, cwd: str = ".", agents: list[str] = None
+    prompt: str, rounds: int = 3, cwd: str = ".", agents: list[str] = None, project_id: str = "default", force: bool = False
 ) -> Iterator[str]:
     try:
         enabled = enabled_agents()
@@ -205,7 +211,10 @@ def run_debate(
         # ── Context Injection ──
         # Fetch relevant project knowledge, past Q&A, and file structures
         # session_id="debate" ensures we don't pollute the user's regular chat cache
-        raw_context = agent_router.check_memory(prompt, session_id="debate")
+        # force=True uses global scope: cross-project semantic memory without the current
+        # project's entity graph, so agents aren't tunnel-visioned by local context.
+        scope = "global" if force else "shared"
+        raw_context = agent_router.check_memory(prompt, session_id="debate", project_id=project_id, memory_scope=scope)
         injected_context = ""
         if raw_context:
             injected_context = (
@@ -316,10 +325,17 @@ def run_debate(
                     if outsiders
                     else active_debaters[(r - 1) % len(active_debaters)]
                 )
+                if umpire_agent == "ollama":
+                    ready = agent_factory.get_agent("ollama").is_model_ready()
+                    if not ready:
+                        yield f"__STATUS__: Ollama model '{os.environ.get('LEADAGENT_OLLAMA_MODEL', 'llama3.2:3b')}' unavailable — falling back\n"
+                        # Fall back to first non-ollama outsider or rotate debaters
+                        fallback = next((a for a in all_available if a not in active_debaters and a != "ollama"), None)
+                        umpire_agent = fallback or active_debaters[(r - 1) % len(active_debaters)]
 
                 anon = _anonymise_round(round_responses)
                 umpire_prompt = _UMPIRE.format(
-                    prompt=prompt, 
+                    prompt=prompt,
                     context=injected_context,
                     anonymous_positions=anon
                 )
@@ -391,11 +407,11 @@ def run_debate(
                 # PERSISTENCE: Store synthesis in episodic memory and graph
                 memory_client.store(
                     content=f"DEBATE CONSENSUS ({agent_name}) on '{prompt}':\n\n{response}",
-                    metadata={"type": "debate_synthesis", "agent": agent_name, "topic": prompt, "error": is_error},
+                    metadata={"type": "debate_synthesis", "agent": agent_name, "topic": prompt, "error": is_error, "project_id": project_id},
                     tier="episodic",
                 )
 
-                qid = db.add_question(f"[DEBATE] {prompt}", response, agent_name, error_sourced=is_error)
+                qid = db.add_question(f"[DEBATE] {prompt}", response, agent_name, source_project_id=project_id, error_sourced=is_error)
 
                 try:
                     text = f"{prompt} {response}"
@@ -407,10 +423,10 @@ def run_debate(
                             text,
                         )
                     )
-                    entities = [t for t in technical if 3 < len(t) < 60][:50]
+                    entities = [t for t in technical if 3 < len(t) < 60 and not is_blocked_entity(t)][:50]
                     for name in entities:
-                        db.add_entity(name, "extracted", "", error_sourced=is_error)
-                        db.link_question_to_entity(qid, name)
+                        db.add_entity(name, "extracted", "", source_project_id=project_id, error_sourced=is_error, auto_extracted=True, source_agent="debate")
+                        db.link_question_to_entity(qid, name, project_id=project_id)
                 except Exception as e:
                     print(f"[Debate Persistence] extraction error: {e}")
 
@@ -449,9 +465,26 @@ def run_debate(
             else active_debaters[0]
         )
 
+        if final_umpire == "ollama":
+            ready = agent_factory.get_agent("ollama").is_model_ready()
+            if not ready:
+                yield f"__STATUS__: Ollama unavailable for final synthesis — falling back\n"
+                fallback = (
+                    next((a for a in all_available if a not in active_debaters and a != "ollama"), None)
+                    or next((a for a in active_debaters if a != "ollama"), None)
+                    or active_debaters[0]
+                )
+                final_umpire = fallback
         try:
             final_consensus = _run_sync(final_umpire, umpire_synth_prompt, cwd, mode)
             yield final_consensus
+            # Store distilled consensus as semantic memory — this is the "what we learned"
+            if final_consensus and "[Error" not in final_consensus:
+                memory_client.store(
+                    content=f"Debate consensus on '{prompt}':\n\n{final_consensus}",
+                    metadata={"type": "debate_consensus", "agent": final_umpire, "topic": prompt, "project_id": project_id},
+                    tier="semantic",
+                )
         except Exception as e:
             yield f"\n[Error generating final consensus: {e}]\n"
 

@@ -18,6 +18,9 @@ data/
 leadagent-data/
 usage/
 *.plist
+.installed
+/db
+/db.wal
 
 # Temporary / Debug
 tmp*.json

@@ -27,72 +27,93 @@ DASHBOARD_HTML = """
                 </div>
                 <h1 class="text-2xl font-bold tracking-tight">LeadAgent <span class="text-indigo-400">Dashboard</span></h1>
             </div>
-            <div id="connection-status" class="flex items-center gap-2 text-sm text-slate-400">
-                <span class="w-2 h-2 rounded-full bg-green-500"></span>
-                Daemon Connected
+            <div class="flex items-center gap-3">
+                <div id="connection-status" class="flex items-center gap-2 text-sm text-slate-400">
+                    <span class="w-2 h-2 rounded-full bg-green-500"></span>
+                    Daemon Connected
+                </div>
+                <form method="post" action="/dashboard/logout">
+                    <button type="submit" title="Sign out" class="text-slate-500 hover:text-red-400 transition">
+                        <i data-lucide="log-out" class="w-4 h-4"></i>
+                    </button>
+                </form>
             </div>
         </header>
 
-        <!-- Knowledge Graph Map (Phase 2) -->
+        <!-- Knowledge Graph -->
         <div class="card p-5 mb-8">
-            <div class="flex items-center justify-between mb-4">
+            <div class="flex items-center justify-between mb-3">
                 <div class="flex items-center gap-2 text-slate-400">
                     <i data-lucide="network" class="w-4 h-4"></i>
-                    <h2 class="text-sm font-semibold uppercase tracking-wider">Knowledge Graph (Real-time)</h2>
+                    <h2 class="text-sm font-semibold uppercase tracking-wider">Memory Graph</h2>
                 </div>
-                <button onclick="refreshGraph()" class="text-slate-500 hover:text-white transition">
-                    <i data-lucide="refresh-cw" class="w-4 h-4"></i>
-                </button>
-            </div>
-            <div id="knowledge-graph" class="h-[400px] w-full bg-slate-900/50 rounded-lg border border-slate-700/50"></div>
-        </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-            <div class="card p-5">
-                <div class="flex items-center gap-2 mb-4 text-slate-400">
-                    <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
-                    <h2 class="text-sm font-semibold uppercase tracking-wider">Agent ROI</h2>
-                </div>
-                <div id="roi-stats" class="space-y-4">
-                    <!-- ROI injected here -->
-                </div>
-            </div>
-
-            <div class="md:col-span-2 card p-5">
-                <div class="flex items-center gap-2 mb-4 text-slate-400">
-                    <i data-lucide="zap" class="w-4 h-4"></i>
-                    <h2 class="text-sm font-semibold uppercase tracking-wider">Active Quotas</h2>
-                </div>
-                <div id="quota-grid" class="grid grid-cols-1 sm:grid-cols-2 gap-6">
-                    <!-- Quotas injected here -->
-                </div>
-            </div>
-        </div>
-
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <div class="card p-5">
-                <div class="flex items-center justify-between mb-4">
-                    <div class="flex items-center gap-2 text-slate-400">
-                        <i data-lucide="list" class="w-4 h-4"></i>
-                        <h2 class="text-sm font-semibold uppercase tracking-wider">Recent Activity</h2>
-                    </div>
-                    <button onclick="refreshHistory()" class="text-slate-500 hover:text-white transition">
+                <div class="flex items-center gap-2">
+                    <select id="graph-type-filter" onchange="applyFilters()"
+                        class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500 cursor-pointer">
+                        <option value="">All types</option>
+                        <option value="extracted">Entity (extracted)</option>
+                        <option value="concept">Concept</option>
+                        <option value="file">File</option>
+                        <option value="sem_episodic">Episodic memory</option>
+                        <option value="sem_semantic">Semantic memory</option>
+                    </select>
+                    <input id="graph-search" type="text" placeholder="Search nodes…"
+                        oninput="applyFilters()"
+                        class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-white w-36 focus:outline-none focus:border-indigo-500">
+                    <button onclick="togglePhysics()" id="physics-btn"
+                        class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 transition">⏸ Freeze</button>
+                    <button onclick="refreshGraph()" class="text-slate-500 hover:text-white transition ml-1">
                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                     </button>
                 </div>
-                <div id="activity-list" class="space-y-4">
-                    <!-- History injected here -->
+            </div>
+            <!-- legend -->
+            <div class="flex flex-wrap gap-3 mb-3 text-[10px] text-slate-400">
+                <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full inline-block" style="background:#6366f1"></span>Entity (extracted)</span>
+                <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full inline-block" style="background:#8b5cf6"></span>Concept</span>
+                <span class="flex items-center gap-1"><span class="w-2 h-2 rounded" style="background:#475569;transform:rotate(45deg);display:inline-block"></span> File</span>
+                <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full inline-block" style="background:#f59e0b"></span>Episodic memory</span>
+                <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full inline-block" style="background:#10b981"></span>Semantic memory</span>
+            </div>
+            <div class="flex gap-3">
+                <div id="knowledge-graph" class="flex-1 h-[480px] bg-slate-900/50 rounded-lg border border-slate-700/50"></div>
+                <!-- side panel -->
+                <div id="graph-panel" class="hidden w-64 flex-shrink-0 bg-slate-900/70 rounded-lg border border-slate-700/50 p-4 text-sm overflow-y-auto">
+                    <div class="flex justify-between items-start mb-3">
+                        <span class="font-semibold text-white" id="panel-title">Node</span>
+                        <button onclick="document.getElementById('graph-panel').classList.add('hidden')" class="text-slate-500 hover:text-white text-xs">✕</button>
+                    </div>
+                    <div id="panel-body" class="space-y-2 text-xs text-slate-300"></div>
+                    <button id="panel-forget" onclick="forgetNode()"
+                        class="mt-4 w-full text-xs bg-red-900/50 hover:bg-red-800 text-red-300 border border-red-800 rounded px-2 py-1.5 transition hidden">
+                        🗑 Forget this entity
+                    </button>
                 </div>
             </div>
+        </div>
 
-            <div class="card p-5">
-                <div class="flex items-center gap-2 mb-4 text-slate-400">
-                    <i data-lucide="settings" class="w-4 h-4"></i>
-                    <h2 class="text-sm font-semibold uppercase tracking-wider">Agent Routing</h2>
+        <div class="card p-5 mb-8">
+            <div class="flex items-center gap-2 mb-4 text-slate-400">
+                <i data-lucide="settings" class="w-4 h-4"></i>
+                <h2 class="text-sm font-semibold uppercase tracking-wider">Agent Routing</h2>
+            </div>
+            <div id="agent-list" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <!-- Agents injected here -->
+            </div>
+        </div>
+
+        <div class="card p-5">
+            <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center gap-2 text-slate-400">
+                    <i data-lucide="list" class="w-4 h-4"></i>
+                    <h2 class="text-sm font-semibold uppercase tracking-wider">Recent Activity</h2>
                 </div>
-                <div id="agent-list" class="space-y-4">
-                    <!-- Agents injected here -->
-                </div>
+                <button onclick="refreshHistory()" class="text-slate-500 hover:text-white transition">
+                    <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                </button>
+            </div>
+            <div id="activity-list" class="space-y-4">
+                <!-- History injected here -->
             </div>
         </div>
 
@@ -174,9 +195,7 @@ DASHBOARD_HTML = """
                 const resp = await fetch('/health');
                 const data = await resp.json();
                 
-                updateQuotaGrid(data.components.agents, data.quotas);
                 updateAgentList(data.components.agents);
-                updateROI();
             } catch (err) {
                 console.error('Failed to fetch health:', err);
                 document.getElementById('connection-status').innerHTML = '<span class="w-2 h-2 rounded-full bg-red-500"></span> Disconnected';
@@ -184,94 +203,152 @@ DASHBOARD_HTML = """
         }
 
         let network = null;
+        let allNodes = [], allEdges = [];
+        let physicsOn = true;
+        let selectedNodeId = null;
+
         async function refreshGraph() {
             try {
                 const resp = await fetch('/memory/graph/d3');
                 const data = await resp.json();
-                
-                const container = document.getElementById('knowledge-graph');
-                const options = {
-                    nodes: {
-                        shape: 'dot',
-                        size: 16,
-                        font: { size: 12, color: '#f8fafc' },
-                        borderWidth: 2,
-                        shadow: true
-                    },
-                    edges: {
-                        width: 1,
-                        color: { inherit: 'from' },
-                        arrows: { to: { enabled: true, scaleFactor: 0.5 } },
-                        smooth: { type: 'continuous' }
-                    },
-                    groups: {
-                        file: { color: { background: '#64748b', border: '#475569' }, shape: 'diamond' },
-                        entity: { color: { background: '#6366f1', border: '#4338ca' } }
-                    },
-                    physics: {
-                        enabled: true,
-                        stabilization: { iterations: 100 }
-                    }
-                };
-                
-                if (network) network.destroy();
-                network = new vis.Network(container, data, options);
+                allNodes = data.nodes;
+                allEdges = data.edges;
+                renderGraph(allNodes, allEdges);
             } catch (err) {
                 console.error('Graph fetch failed:', err);
             }
         }
 
-        async function updateROI() {
-            try {
-                const resp = await fetch('/v1/roi');
-                const data = await resp.json();
-                const container = document.getElementById('roi-stats');
-                container.innerHTML = '';
-                
-                Object.entries(data).forEach(([agent, stats]) => {
-                    const div = document.createElement('div');
-                    div.className = 'space-y-1';
-                    const rate = (stats.success_rate * 100).toFixed(0);
-                    div.innerHTML = `
-                        <div class="flex justify-between text-[10px] uppercase font-bold text-slate-500">
-                            <span>${agent}</span>
-                            <span>${rate}% success</span>
-                        </div>
-                        <div class="progress-bg h-1">
-                            <div class="progress-fill bg-indigo-500" style="width: ${rate}%"></div>
-                        </div>
-                    `;
-                    container.appendChild(div);
-                });
-            } catch (err) {}
+        function renderGraph(nodes, edges) {
+            const container = document.getElementById('knowledge-graph');
+            const options = {
+                nodes: {
+                    shape: 'dot', size: 14,
+                    font: { size: 11, color: '#cbd5e1' },
+                    borderWidth: 2, shadow: true,
+                },
+                edges: {
+                    width: 1.2,
+                    color: { inherit: 'from', opacity: 0.6 },
+                    arrows: { to: { enabled: true, scaleFactor: 0.4 } },
+                    smooth: { type: 'dynamic' },
+                    font: { size: 9, color: '#64748b', align: 'middle' },
+                },
+                groups: {
+                    extracted:   { color: { background: '#6366f1', border: '#4338ca' } },
+                    concept:     { color: { background: '#8b5cf6', border: '#6d28d9' } },
+                    entity:      { color: { background: '#6366f1', border: '#4338ca' } },
+                    file:        { color: { background: '#475569', border: '#334155' }, shape: 'diamond' },
+                    sem_episodic:{ color: { background: '#f59e0b', border: '#d97706' }, shape: 'square' },
+                    sem_semantic:{ color: { background: '#10b981', border: '#059669' }, shape: 'square' },
+                },
+                physics: {
+                    enabled: physicsOn,
+                    barnesHut: { gravitationalConstant: -4000, springLength: 120 },
+                    stabilization: { iterations: 150 },
+                },
+                interaction: { hover: true, tooltipDelay: 150 },
+            };
+            if (network) network.destroy();
+            network = new vis.Network(container, { nodes, edges }, options);
+
+            network.on('click', params => {
+                if (params.nodes.length > 0) showNodePanel(params.nodes[0]);
+                else document.getElementById('graph-panel').classList.add('hidden');
+            });
+
+            network.on('doubleClick', params => {
+                if (params.nodes.length > 0) {
+                    const n = allNodes.find(x => x.id === params.nodes[0]);
+                    if (n && n.source === 'kuzu' && n.group !== 'file') {
+                        if (confirm(`Forget entity "${n.label}" from memory?`)) forgetNode(n.id);
+                    }
+                }
+            });
         }
 
-        function updateQuotaGrid(agents, quotas) {
-            const grid = document.getElementById('quota-grid');
-            grid.innerHTML = '';
-            
-            ['claude', 'gemini'].forEach(key => {
-                const q = quotas[key];
-                const ag = agents[key];
-                if (!ag || !ag.installed) return;
+        function showNodePanel(nodeId) {
+            selectedNodeId = nodeId;
+            const n = allNodes.find(x => x.id === nodeId);
+            if (!n) return;
+            const panel = document.getElementById('graph-panel');
+            panel.classList.remove('hidden');
+            document.getElementById('panel-title').textContent = n.label;
+            const connected = allEdges
+                .filter(e => e.from === nodeId || e.to === nodeId)
+                .map(e => {
+                    const otherId = e.from === nodeId ? e.to : e.from;
+                    const other = allNodes.find(x => x.id === otherId);
+                    return `<span class="inline-block bg-slate-700 rounded px-1.5 py-0.5 mr-1 mb-1">${other ? other.label : otherId}</span>`;
+                }).join('');
+            document.getElementById('panel-body').innerHTML = `
+                <div><span class="text-slate-500">Source:</span> ${n.source === 'agentmemory' ? '🟡 AgentMemory' : '🔵 KuzuDB'}</div>
+                <div><span class="text-slate-500">Type:</span> ${n.group}</div>
+                ${connected ? `<div class="mt-2"><div class="text-slate-500 mb-1">Connected to:</div>${connected}</div>` : '<div class="text-slate-500">No connections</div>'}
+            `;
+            const forgetBtn = document.getElementById('panel-forget');
+            if (n.source === 'kuzu' && n.group !== 'file') forgetBtn.classList.remove('hidden');
+            else forgetBtn.classList.add('hidden');
+        }
 
-                const pct = q.real_daily_pct || 0;
-                const colorClass = pct > 80 ? 'bg-red-500' : (pct > 50 ? 'bg-yellow-500' : 'bg-green-500');
-                
-                const card = document.createElement('div');
-                card.className = 'space-y-2';
-                card.innerHTML = `
-                    <div class="flex justify-between items-center text-xs">
-                        <span class="font-bold uppercase" style="color: ${getAgentColor(key)}">${key}</span>
-                        <span class="text-slate-400">${pct.toFixed(0)}%</span>
-                    </div>
-                    <div class="progress-bg">
-                        <div class="progress-fill ${colorClass}" style="width: ${pct}%"></div>
-                    </div>
-                    <div class="text-[10px] text-slate-500">Daily subscription limit</div>
-                `;
-                grid.appendChild(card);
+        async function forgetNode(nodeId) {
+            const id = nodeId || selectedNodeId;
+            if (!id) return;
+            const n = allNodes.find(x => x.id === id);
+            if (!n) return;
+            if (!nodeId && !confirm(`Forget entity "${n.label}" from memory?`)) return;
+            try {
+                await fetch('/memory/forget', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ entity_name: id }),
+                });
+                document.getElementById('graph-panel').classList.add('hidden');
+                await refreshGraph();
+            } catch (err) {
+                alert('Failed to forget node: ' + err.message);
+            }
+        }
+
+        function applyFilters() {
+            if (!network) return;
+            const typeFilter = document.getElementById('graph-type-filter').value;
+            const q = document.getElementById('graph-search').value.trim().toLowerCase();
+
+            // Step 1: type filter — if set, only nodes of that group are "in scope"
+            const typeMatch = n => !typeFilter || n.group === typeFilter;
+
+            // Step 2: search filter — within type-scoped nodes, highlight by label
+            const searchMatch = n => !q || n.label.toLowerCase().includes(q);
+
+            const activeIds = new Set(allNodes.filter(n => typeMatch(n) && searchMatch(n)).map(n => n.id));
+            const dimIds   = new Set(allNodes.filter(n => typeMatch(n) && !searchMatch(n)).map(n => n.id));
+            // nodes outside type filter are hidden entirely when a type is selected
+            const hiddenIds = new Set(allNodes.filter(n => !typeMatch(n)).map(n => n.id));
+
+            const noFilter = !typeFilter && !q;
+
+            const styled = allNodes.map(n => {
+                if (noFilter) return { ...n, opacity: 1, font: { color: '#cbd5e1' } };
+                if (hiddenIds.has(n.id)) return { ...n, opacity: 0.05, font: { color: '#1e293b' } };
+                if (activeIds.has(n.id)) return { ...n, opacity: 1,    font: { color: '#f8fafc' } };
+                return { ...n, opacity: 0.12, font: { color: '#334155' } };
             });
+
+            const styledEdges = allEdges.map(e => ({
+                ...e,
+                color: (noFilter || (activeIds.has(e.from) && activeIds.has(e.to)))
+                    ? undefined
+                    : { color: '#1e293b', opacity: 0.08 },
+            }));
+
+            network.setData({ nodes: styled, edges: styledEdges });
+        }
+
+        function togglePhysics() {
+            physicsOn = !physicsOn;
+            if (network) network.setOptions({ physics: { enabled: physicsOn } });
+            document.getElementById('physics-btn').textContent = physicsOn ? '⏸ Freeze' : '▶ Unfreeze';
         }
 
         function updateAgentList(agents) {

@@ -148,7 +148,7 @@ class TestRunDebate:
     def test_umpire_runs_between_rounds(self):
         calls = []
 
-        def fake_run(agent, prompt, cwd, mode="plan"):
+        def fake_run(agent, prompt, cwd, mode="plan", status_q=None):
             calls.append((agent, prompt[:30]))
             return "resp"
 
@@ -169,7 +169,7 @@ class TestRunDebate:
     def test_umpire_uses_outsider_when_available(self):
         chosen = []
 
-        def fake_run(agent, prompt, cwd, mode="plan"):
+        def fake_run(agent, prompt, cwd, mode="plan", status_q=None):
             chosen.append(agent)
             return "resp"
 
@@ -190,7 +190,7 @@ class TestRunDebate:
         # Only debaters available → umpire must come from debaters
         invoked = []
 
-        def fake_run(agent, prompt, cwd, mode="plan"):
+        def fake_run(agent, prompt, cwd, mode="plan", status_q=None):
             invoked.append(agent)
             return "resp"
 
@@ -210,7 +210,7 @@ class TestRunDebate:
     def test_umpire_fallback_question_on_exception(self):
         call_count = {"n": 0}
 
-        def fake_run(agent, prompt, cwd, mode="plan"):
+        def fake_run(agent, prompt, cwd, mode="plan", status_q=None):
             call_count["n"] += 1
             # Cause umpire to fail (umpire runs after first round of debaters)
             if "moderator" in prompt.lower() or "impartial" in prompt.lower():
@@ -231,7 +231,7 @@ class TestRunDebate:
         assert "fundamental assumption" in joined
 
     def test_agent_error_captured_in_response(self):
-        def fake_run(agent, prompt, cwd, mode="plan"):
+        def fake_run(agent, prompt, cwd, mode="plan", status_q=None):
             raise RuntimeError("agent crash")
 
         with (

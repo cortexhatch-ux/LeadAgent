@@ -20,6 +20,27 @@ SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
 port = 8000 if os.path.exists("/.dockerenv") else 8001
 BACKEND_URL = os.environ.get("LEADAGENT_BACKEND_URL", f"http://backend:{port}")
 
+# Per-user authorization: comma-separated Slack user IDs in LEADAGENT_SLACK_ALLOWED_USERS.
+# If unset or empty, all workspace members can trigger debates (open mode).
+_ALLOWED_USERS_RAW = os.environ.get("LEADAGENT_SLACK_ALLOWED_USERS", "")
+_ALLOWED_USERS: set[str] = {u.strip() for u in _ALLOWED_USERS_RAW.split(",") if u.strip()}
+
+def _is_authorized(user_id: str) -> bool:
+    if not _ALLOWED_USERS:
+        return True
+    return user_id in _ALLOWED_USERS
+
+# Backend API key for authenticating internal HTTP calls.
+def _backend_headers() -> dict:
+    try:
+        from backend.security import get_api_key
+        key = get_api_key()
+        if key:
+            return {"X-LeadAgent-Key": key}
+    except Exception:
+        pass
+    return {}
+
 # Marker prefixes
 PREFIX_ROUND = "__DEBATE_ROUND__"
 PREFIX_AGENT = "__DEBATE_AGENT__"
@@ -58,6 +79,7 @@ def execute_debate(topic: str, channel_id: str, user_id: str):
         resp = requests.post(
             f"{BACKEND_URL}/debate",
             json={"prompt": topic, "rounds": 3},
+            headers=_backend_headers(),
             stream=True,
             timeout=1800 # Debates can take a long time
         )
@@ -162,15 +184,18 @@ def execute_debate(topic: str, channel_id: str, user_id: str):
 if app:
     @app.command("/debate")
     def handle_debate_command(ack, command, respond):
-        logger.info(f"Received /debate command from user {command.get('user_id')} in channel {command.get('channel_id')}")
+        user_id = command.get("user_id")
+        logger.info(f"Received /debate command from user {user_id} in channel {command.get('channel_id')}")
         ack()
+        if not _is_authorized(user_id):
+            respond("You are not authorized to use LeadAgent debates.")
+            return
         topic = command.get("text")
         if not topic:
             logger.info("No topic provided in /debate command")
             respond("Please provide a topic: `/debate Should we use React or Vue?`")
             return
-        
-        user_id = command.get("user_id")
+
         channel_id = command.get("channel_id")
         
         logger.info(f"Starting debate thread for topic: {topic}")
@@ -182,12 +207,15 @@ if app:
 
     @app.event("app_mention")
     def handle_mentions(event, say):
-        logger.info(f"Received app_mention from user {event.get('user')} in channel {event.get('channel')}")
+        user_id = event.get("user")
+        logger.info(f"Received app_mention from user {user_id} in channel {event.get('channel')}")
+        if not _is_authorized(user_id):
+            say("You are not authorized to use LeadAgent debates.")
+            return
         text = event.get("text", "")
         if "debate" in text.lower():
             topic = text.lower().split("debate")[-1].strip()
             if topic:
-                user_id = event.get("user")
                 channel_id = event.get("channel")
                 logger.info(f"Starting debate thread for topic: {topic}")
                 threading.Thread(
@@ -202,16 +230,16 @@ if app:
             say("I am LeadAgent. Try `@LeadAgent debate <topic>` or use the `/debate` command.")
 
 if __name__ == "__main__":
-    if app and SLACK_APP_TOKEN:
-        logger.info("Starting LeadAgent Slack Bot (Socket Mode)...")
-        # Quick health check of the backend
-        try:
-            r = requests.get(f"{BACKEND_URL}/health", timeout=5)
-            logger.info(f"Backend health check: {r.status_code} {r.json().get('status')}")
-        except Exception as e:
-            logger.error(f"Backend unreachable at {BACKEND_URL}: {e}")
+    if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
+        logger.info("Slack bot disabled — set SLACK_BOT_TOKEN and SLACK_APP_TOKEN to enable.")
+        raise SystemExit(0)
 
-        handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-        handler.start()
-    else:
-        logger.error("Slack bot configuration missing (Tokens).")
+    logger.info("Starting LeadAgent Slack Bot (Socket Mode)...")
+    try:
+        r = requests.get(f"{BACKEND_URL}/health", timeout=5)
+        logger.info(f"Backend health check: {r.status_code} {r.json().get('status')}")
+    except Exception as e:
+        logger.error(f"Backend unreachable at {BACKEND_URL}: {e}")
+
+    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+    handler.start()

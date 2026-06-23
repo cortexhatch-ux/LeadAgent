@@ -2,7 +2,7 @@
 
 Route any prompt to **Claude**, **Gemini**, **Codex**, or **Grok** from a single terminal command — using your existing subscriptions, with full cross-project memory and zero per-token cost.
 
-> **Latest Release: v0.6.0** — Migrated Gemini integration from the deprecated `gemini-cli` to Google's new Antigravity CLI (`agy`). Breaking change: re-run onboarding and rebuild the Gemini container after upgrading.
+> **Latest Release: v0.7.0** — Interactive knowledge graph, dual-tier semantic memory, httpOnly cookie auth for the dashboard, and hardened debate engine.
 
 ## Visual Tour
 
@@ -39,7 +39,15 @@ leadagent health
 # → backend: ok  agentmemory: ok  ollama: ok (if installed)
 ```
 
-Open the dashboard: [http://localhost:8000/dashboard](http://localhost:8000/dashboard)
+If something looks wrong, run the full environment diagnostic:
+
+```bash
+leadagent doctor
+```
+
+This checks local prerequisites (python3, go, npm), backend reachability, agent authentication, AgentMemory, and Ollama — and prints a pass/fail row for each with a fix hint.
+
+Open the dashboard: [http://localhost:8000/dashboard](http://localhost:8000/dashboard) — you will be redirected to a login page; enter your API key (stored in `leadagent-data/api.key`) once to receive a session cookie valid for 8 hours.
 
 Send your first prompt:
 
@@ -81,8 +89,13 @@ leadagent health
 - **Privacy-First** — your knowledge graph lives entirely on your machine
 - **Editor Agnostic** — works alongside any IDE via the terminal and MCP interface
 
-## Features in v0.6.0
+## Features in v0.7.0
 
+- **Interactive Knowledge Graph**: Click any node to inspect source, type, and connections. Double-click a node to forget it. Filter by node type (entity / concept / file / episodic / semantic), search by name, freeze physics, and refresh live. Color-coded legend distinguishes KuzuDB entities from AgentMemory semantic/episodic memories.
+- **Dual-Tier Memory**: Every completed Q&A pair is written to **episodic** memory; debate consensus and distilled knowledge go to **semantic** memory. Both layers are surfaced in the graph and retrieved on future prompts.
+- **AgentMemory in Graph**: The knowledge graph now includes `agentmemory` nodes (episodic and semantic) alongside KuzuDB entities, auto-linked where entity names appear in memory content.
+- **Secure Dashboard Login**: The dashboard is now protected by an httpOnly session cookie (`la_session`, 8-hour expiry). No more query-param key passing — browser JS never sees the key or token.
+- **Force-Global Debate Memory**: `--no-context` debate mode uses cross-project semantic memory (global scope) so agents aren't tunnel-visioned by local project context.
 - **Antigravity (agy) Integration**: Gemini now routes through Google's new `agy` CLI — supports Gemini 3.5 Flash and 3.1 Pro with automatic model fallback.
 - **Full Agent Parity**: Robust support for Claude, Gemini (via `agy`), Codex, and Grok.
 - **Async Debate Streaming**: Watch agents argue in real-time with live status updates.
@@ -106,8 +119,8 @@ prompt
 2. **Router** scores task affinity across enabled agents and picks the best fit
 3. **CLI** runs in `plan` (text) or `execute` (tool use / agentic) mode
 4. **Stream** is relayed token-by-token with status heartbeats
-5. **Memory** stores the outcome in the local knowledge graph
-6. **Dashboard** updates usage, ROI, and session history in real time
+5. **Memory** stores the Q&A pair in episodic memory (KuzuDB + AgentMemory) and extracts entities into the knowledge graph
+6. **Dashboard** updates usage and session history in real time; the interactive graph shows all memory layers
 
 ## Daemon Management
 
@@ -116,6 +129,8 @@ prompt
 ./start_backend.sh --daemon     # start in background
 ./start_backend.sh backend      # restart only the FastAPI backend
 leadagent --onboarding          # re-run setup wizard
+leadagent health                # quick status check
+leadagent doctor                # full environment diagnostic (auth, memory, models)
 tail -f leadagent-data/daemon.log
 ```
 
@@ -128,6 +143,25 @@ git pull origin main
 ./install.sh
 ```
 This will automatically rebuild the CLI, refresh your Docker containers, and pull any new local models (like Ollama's Llama 3.2).
+
+### Upgrading to v0.7.0 (recommended: fresh install)
+
+v0.7.0 includes KuzuDB schema changes (new `session_id` column on `Question` nodes) and Docker resource labels were added to all containers. If you are running a previous version, the cleanest path is a full reset:
+
+```bash
+# 1. Remove old containers and volumes (Docker labels changed — compose may not recognise existing resources)
+docker compose down -v
+docker rm -f $(docker ps -aq --filter "name=leadagent") 2>/dev/null || true
+
+# 2. Wipe local state (graph DB, config, usage cache)
+./nuke.sh
+
+# 3. Pull and reinstall
+git pull origin main
+./install.sh
+```
+
+> If you want to keep your knowledge graph, back up `leadagent-data/graph/` before running `nuke.sh`. The KuzuDB migration in v0.7.0 is additive (`ALTER TABLE ... ADD COLUMN` with a default), so an existing graph *may* survive, but it has not been tested against all older schema versions.
 
 ### Upgrading to v0.6.0 (breaking change)
 

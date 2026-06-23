@@ -10,10 +10,21 @@ from backend.main import app
 from backend.permissions import PermissionBroker
 
 
+_TEST_KEY = "test-api-key-fixture-only"
+
+
 @pytest.fixture
-def client():
-    # base_url must be a loopback host so GuardMiddleware admits the request
-    # (TestClient otherwise sends Host: testserver).
+def client(monkeypatch):
+    # Patch get_api_key so GuardMiddleware sees a known key, then set that key
+    # on all requests via headers so they pass the auth check.
+    monkeypatch.setattr("backend.security.get_api_key", lambda: _TEST_KEY)
+    monkeypatch.setattr("backend.main.get_api_key", lambda: _TEST_KEY)
+    return TestClient(app, base_url="http://localhost:8000", headers={"X-LeadAgent-Key": _TEST_KEY})
+
+
+@pytest.fixture
+def bare_client():
+    """TestClient with no auto-auth headers — for tests that exercise key validation itself."""
     return TestClient(app, base_url="http://localhost:8000")
 
 
@@ -44,7 +55,8 @@ class TestGuardMiddleware:
         resp = client.get("/", headers={"origin": "https://evil.example.com"})
         assert resp.status_code == 403
 
-    def test_loopback_origin_allowed(self, client):
+    def test_loopback_origin_allowed(self, client, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: None)
         resp = client.get("/", headers={"origin": "http://localhost:8000"})
         assert resp.status_code == 200
 
@@ -310,3 +322,279 @@ class TestChat:
             resp = client.post("/chat", json={"prompt": "hi", "session_id": "s1"})
 
         assert "__PERMISSION_REQUEST__:" in resp.text
+
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+
+class TestRateLimiting:
+    def test_rate_limit_hit_returns_429(self, client):
+        from backend.security import _check_rate_limit, _RATE_LIMIT_RPM, _rate_buckets
+        import time as _t
+        # Fill the bucket for a fake IP on /chat
+        ip, path = "10.0.0.99", "/chat"
+        key = (ip, path)
+        _rate_buckets.pop(key, None)
+        now = _t.monotonic()
+        from collections import deque
+        _rate_buckets[key] = deque([now] * _RATE_LIMIT_RPM)
+        # The next check should fail
+        assert not _check_rate_limit(ip, path)
+        _rate_buckets.pop(key, None)
+
+    def test_rate_limit_not_hit_within_budget(self):
+        from backend.security import _check_rate_limit, _rate_buckets
+        ip, path = "10.0.0.88", "/chat"
+        _rate_buckets.pop((ip, path), None)
+        assert _check_rate_limit(ip, path)
+        _rate_buckets.pop((ip, path), None)
+
+
+# ── API key enforcement ───────────────────────────────────────────────────────
+
+class TestAPIKey:
+    def test_correct_key_allowed(self, bare_client, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: "test-key-abc")
+        resp = bare_client.get("/roles", headers={"x-leadagent-key": "test-key-abc"})
+        assert resp.status_code == 200
+
+    def test_wrong_key_rejected(self, bare_client, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: "test-key-abc")
+        resp = bare_client.get("/roles", headers={"x-leadagent-key": "wrong-key"})
+        assert resp.status_code == 401
+
+    def test_missing_key_rejected(self, bare_client, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: "test-key-abc")
+        resp = bare_client.get("/roles")
+        assert resp.status_code == 401
+
+
+# ── API key matrix: all non-exempt endpoints require key (issue #1) ───────────
+
+_KEY = "matrix-test-key"
+
+_NON_EXEMPT_ENDPOINTS = [
+    ("GET",    "/roles"),
+    ("POST",   "/chat"),
+    ("POST",   "/memory/query"),
+    ("POST",   "/memory/forget"),
+    ("POST",   "/permission/_request"),
+    ("POST",   "/permission/nonexistent/decide"),
+    ("GET",    "/permission/nonexistent/wait"),
+    ("GET",    "/rules"),
+    ("POST",   "/rules"),
+    ("DELETE", "/rules/nonexistent"),
+    ("POST",   "/rules/evaluate"),
+]
+
+_EXEMPT_ENDPOINTS = [
+    ("GET", "/"),
+    ("GET", "/health"),
+    ("GET", "/v1/status"),
+    ("GET", "/doctor"),
+]
+
+
+class TestAPIKeyMatrix:
+    """Every non-exempt endpoint must return 401 when the key is absent."""
+
+    @pytest.fixture(autouse=True)
+    def _set_key(self, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: _KEY)
+        monkeypatch.setattr("backend.main.get_api_key", lambda: _KEY)
+
+    @pytest.mark.parametrize("method,path", _NON_EXEMPT_ENDPOINTS)
+    def test_missing_key_returns_401(self, bare_client, method, path):
+        resp = bare_client.request(method, path, json={})
+        assert resp.status_code == 401, (
+            f"{method} {path} returned {resp.status_code}, expected 401"
+        )
+
+    @pytest.mark.parametrize("method,path", _EXEMPT_ENDPOINTS)
+    def test_exempt_path_accessible_without_key(self, bare_client, method, path):
+        with (
+            patch("backend.main.db.query_all", return_value=[[0]]),
+            patch("backend.main.shutil.which", return_value=None),
+        ):
+            resp = bare_client.request(method, path)
+        # Exempt paths must not 401 — other errors (503, 500) are acceptable
+        assert resp.status_code != 401, (
+            f"Exempt {method} {path} should never 401 (got {resp.status_code})"
+        )
+
+
+# ── /permission/{id}/decide unauthenticated (issue #3) ───────────────────────
+
+class TestPermissionDecideUnauth:
+    def test_unauthenticated_decide_returns_401(self, bare_client, fresh_broker, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: _KEY)
+        monkeypatch.setattr("backend.main.get_api_key", lambda: _KEY)
+        pr = fresh_broker.create("s1", "claude", "Bash", {})
+        resp = bare_client.post(f"/permission/{pr.id}/decide", json={"behavior": "allow"})
+        assert resp.status_code == 401
+
+    def test_unauthenticated_permission_request_returns_401(self, bare_client, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: _KEY)
+        monkeypatch.setattr("backend.main.get_api_key", lambda: _KEY)
+        resp = bare_client.post("/permission/_request", json={
+            "session_id": "s1", "agent": "claude", "tool_name": "Bash", "input": {},
+        })
+        assert resp.status_code == 401
+
+
+# ── /memory/forget unauthenticated (issue #4) ────────────────────────────────
+
+class TestMemoryForgetUnauth:
+    def test_unauthenticated_forget_returns_401(self, bare_client, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: _KEY)
+        monkeypatch.setattr("backend.main.get_api_key", lambda: _KEY)
+        resp = bare_client.post("/memory/forget", json={"session_id": "s1"})
+        assert resp.status_code == 401
+
+    def test_authenticated_forget_succeeds(self, bare_client, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: _KEY)
+        monkeypatch.setattr("backend.main.get_api_key", lambda: _KEY)
+        with patch("backend.main.db.query"):
+            resp = bare_client.post(
+                "/memory/forget",
+                json={"session_id": "s1"},
+                headers={"X-LeadAgent-Key": _KEY},
+            )
+        assert resp.status_code == 200
+
+
+# ── /rules CRUD unauthenticated (issue #7) ────────────────────────────────────
+
+class TestRulesCRUDUnauth:
+    @pytest.fixture(autouse=True)
+    def _set_key(self, monkeypatch):
+        monkeypatch.setattr("backend.security.get_api_key", lambda: _KEY)
+        monkeypatch.setattr("backend.main.get_api_key", lambda: _KEY)
+
+    def test_list_rules_unauth_returns_401(self, bare_client):
+        resp = bare_client.get("/rules")
+        assert resp.status_code == 401
+
+    def test_create_rule_unauth_returns_401(self, bare_client):
+        resp = bare_client.post("/rules", json={
+            "tool_pattern": "Bash", "action": "allow",
+        })
+        assert resp.status_code == 401
+
+    def test_delete_rule_unauth_returns_401(self, bare_client):
+        resp = bare_client.delete("/rules/some-rule-id")
+        assert resp.status_code == 401
+
+    def test_evaluate_rule_unauth_returns_401(self, bare_client):
+        resp = bare_client.post("/rules/evaluate", json={
+            "tool_name": "Bash", "input": {},
+        })
+        assert resp.status_code == 401
+
+
+# ── project_id validation on ChatRequest ─────────────────────────────────────
+
+class TestProjectIDValidation:
+    def test_valid_project_id_accepted(self, client):
+        with (
+            patch("backend.main.agent_router.check_memory", return_value=None),
+            patch("backend.main.agent_router.route_multi", return_value=(["none"], {})),
+        ):
+            resp = client.post("/chat", json={"prompt": "hi", "project_id": "my-project_1"})
+        assert resp.status_code == 200
+
+    def test_invalid_project_id_rejected(self, client):
+        resp = client.post("/chat", json={"prompt": "hi", "project_id": "bad/id?here"})
+        assert resp.status_code == 422
+
+    def test_project_id_too_long_rejected(self, client):
+        resp = client.post("/chat", json={"prompt": "hi", "project_id": "a" * 65})
+        assert resp.status_code == 422
+
+
+# ── /memory/entities propagates project_id ───────────────────────────────────
+
+class TestMemoryEntitiesProjectID:
+    def test_project_id_passed_to_db(self, client, _mock_db):
+        resp = client.post("/memory/entities", json={
+            "name": "FastAPI", "type": "framework", "project_id": "proj-alpha"
+        })
+        assert resp.status_code == 200
+        _mock_db.add_entity.assert_called_once_with(
+            "FastAPI", "framework", "", source_project_id="proj-alpha"
+        )
+
+    def test_default_project_id_requires_promote_header(self, client, _mock_db):
+        resp = client.post("/memory/entities", json={"name": "X", "type": "thing"})
+        assert resp.status_code == 403
+
+    def test_default_project_id_with_promote_header_succeeds(self, client, _mock_db):
+        resp = client.post(
+            "/memory/entities",
+            json={"name": "X", "type": "thing"},
+            headers={"X-LeadAgent-Promote": "1"},
+        )
+        assert resp.status_code == 200
+        _mock_db.add_entity.assert_called_once_with("X", "thing", "", source_project_id="default")
+
+
+# ── /memory/relationships propagates project_id ──────────────────────────────
+
+class TestMemoryRelationshipsProjectID:
+    def test_project_id_passed_to_db(self, client, _mock_db):
+        resp = client.post("/memory/relationships", json={
+            "source": "A", "target": "B", "type": "uses", "project_id": "proj-beta"
+        })
+        assert resp.status_code == 200
+        _mock_db.add_relationship.assert_called_once_with(
+            "A", "B", "uses", project_id="proj-beta"
+        )
+
+    def test_default_project_id_requires_promote_header(self, client, _mock_db):
+        resp = client.post("/memory/relationships", json={
+            "source": "A", "target": "B", "type": "uses"
+        })
+        assert resp.status_code == 403
+
+
+# ── /v1/audit — memory shape normalisation ───────────────────────────────────
+
+class TestAuditSession:
+    def _audit(self, client, history_items):
+        with (
+            patch("backend.main.memory_client.search", return_value=history_items),
+            patch("backend.main.db.query_all", return_value=[]),
+            patch("backend.main._classify_task", return_value=("general", 1)),
+        ):
+            return client.get("/v1/audit/test-session")
+
+    def test_standard_shape(self, client):
+        items = [{"content": "User: hi\nAssistant: hello", "metadata": {"agent": "claude"}}]
+        resp = self._audit(client, items)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data[0]["agent"] == "claude"
+        assert "hi" in data[0]["prompt_preview"]
+
+    def test_observation_shape_narrative(self, client):
+        items = [{"observation": {"narrative": "User: obs prompt\nAssistant: ok", "agent": "gemini"}}]
+        resp = self._audit(client, items)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "obs prompt" in data[0]["prompt_preview"]
+
+    def test_observation_shape_title_fallback(self, client):
+        items = [{"observation": {"title": "some title"}}]
+        resp = self._audit(client, items)
+        assert resp.status_code == 200
+        assert "some title" in resp.json()[0]["prompt_preview"]
+
+    def test_unknown_shape_does_not_crash(self, client):
+        items = [{"unexpected_key": "value"}]
+        resp = self._audit(client, items)
+        assert resp.status_code == 200
+        assert resp.json()[0]["prompt_preview"] == "..."
+
+    def test_empty_history_returns_empty_list(self, client):
+        resp = self._audit(client, [])
+        assert resp.status_code == 200
+        assert resp.json() == []

@@ -9,7 +9,6 @@ Docker mode (detected automatically): runs in a loop via docker-compose, uses th
 
 import json
 import os
-import shutil
 import socket
 import subprocess
 import time
@@ -34,7 +33,9 @@ port = 8000 if IN_DOCKER else 8001
 HEALTH_URL = f"http://backend:{port}/health" if IN_DOCKER else f"http://localhost:{port}/health"
 
 AGENTMEMORY_PORT = 3111
+AGENTMEMORY_CONTAINER = os.environ.get("AGENTMEMORY_CONTAINER", "agentmemory-iii-engine-1")
 MAX_FAILURES = 3
+MAX_AGENTMEMORY_FAILURES = 2
 DOCKER_SOCK = "/var/run/docker.sock"
 
 
@@ -120,29 +121,133 @@ def restart_daemon():
         restart_via_launchctl()
 
 
-# ── agentmemory (native-only — it manages its own Docker containers) ─────────
+# ── agentmemory ───────────────────────────────────────────────────────────────
 
 
-def revive_agentmemory():
-    if IN_DOCKER:
-        return  # agentmemory can't run inside Docker (it IS Docker)
-    if not shutil.which("agentmemory"):
-        return
-    log("agentmemory port dark — attempting restart...")
+def agentmemory_http_ok(timeout: float = 3.0) -> bool:
+    """Returns True only if the iii-engine answers the liveness probe."""
+    import urllib.request
+    host = "host.docker.internal" if IN_DOCKER else "localhost"
+    url = f"http://{host}:{AGENTMEMORY_PORT}/agentmemory/livez"
     try:
-        log_fh = open(DATA_DIR / "agentmemory.log", "a")
-        env = os.environ.copy()
-        env["LEADAGENT_TAG"] = "true"
-        subprocess.Popen(
-            ["agentmemory", "serve", "--port", str(AGENTMEMORY_PORT)],
-            stdout=log_fh,
-            stderr=log_fh,
-            start_new_session=True,
-            env=env,
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status < 500
+    except Exception:
+        return False
+
+
+def _find_iii_engine_container() -> str:
+    """Return the running iii-engine container name, discovered by label."""
+    import json
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect(DOCKER_SOCK)
+        req = (
+            "GET /containers/json?filters=%7B%22label%22%3A%5B%22com.docker.compose.service%3Diii-engine%22%5D%7D"
+            " HTTP/1.0\r\nHost: localhost\r\n\r\n"
         )
-        log("agentmemory restarted.")
+        sock.sendall(req.encode())
+        raw = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+        sock.close()
+        body = raw.split(b"\r\n\r\n", 1)[-1]
+        containers = json.loads(body)
+        if containers:
+            names = containers[0].get("Names", [])
+            if names:
+                return names[0].lstrip("/")
+    except Exception:
+        pass
+    return AGENTMEMORY_CONTAINER
+
+
+def restart_iii_engine_via_docker_socket() -> bool:
+    """Restart the iii-engine container via Docker Unix socket — no CLI needed."""
+    container = _find_iii_engine_container()
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect(DOCKER_SOCK)
+        request = (
+            f"POST /containers/{container}/restart HTTP/1.0\r\n"
+            f"Host: localhost\r\n"
+            f"\r\n"
+        ).encode()
+        sock.sendall(request)
+        response = sock.recv(256).decode("utf-8", errors="ignore")
+        sock.close()
+        if " 204 " in response or " 200 " in response:
+            log(f"{container} restarted via Docker socket.")
+            return True
+        log(f"Docker socket restart of {container} got: {response[:80]}")
+        return False
     except Exception as e:
-        log(f"agentmemory restart failed: {e}")
+        log(f"Docker socket restart of {container} failed: {e}")
+        return False
+
+
+def _restart_agentmemory_native() -> bool:
+    """Native fallback: kill the hung iii process and re-launch agentmemory."""
+    import subprocess
+    import shutil
+    try:
+        # Kill hung native iii process holding the ports
+        subprocess.run(["pkill", "-x", "iii"], capture_output=True)
+        if not shutil.which("agentmemory"):
+            log("agentmemory not on PATH — cannot restart natively")
+            return False
+        log("Restarting agentmemory natively...")
+        log_fh = open(DATA_DIR / "agentmemory.log", "a")
+        subprocess.Popen(
+            ["agentmemory"],
+            stdout=log_fh, stderr=log_fh,
+            start_new_session=True,
+        )
+        return True
+    except Exception as e:
+        log(f"Native agentmemory restart failed: {e}")
+        return False
+
+
+def check_agentmemory(state: dict) -> dict:
+    """HTTP liveness check; restarts the iii-engine after MAX_AGENTMEMORY_FAILURES."""
+    if not os.path.exists(DOCKER_SOCK) and not port_open(AGENTMEMORY_PORT):
+        # No Docker socket and port is dark — try native restart
+        state["agentmemory_failures"] = state.get("agentmemory_failures", 0) + 1
+        log(f"agentmemory port dark, no Docker socket (failure #{state['agentmemory_failures']})")
+        if state["agentmemory_failures"] >= MAX_AGENTMEMORY_FAILURES:
+            if _restart_agentmemory_native():
+                state["agentmemory_failures"] = 0
+        return state
+    if not os.path.exists(DOCKER_SOCK):
+        # Docker not available but port is open — skip (can't restart anyway)
+        return state
+
+    if agentmemory_http_ok():
+        if state.get("agentmemory_failures", 0) > 0:
+            log("agentmemory recovered.")
+        state["agentmemory_failures"] = 0
+        return state
+
+    state["agentmemory_failures"] = state.get("agentmemory_failures", 0) + 1
+    log(
+        f"agentmemory not responding to HTTP "
+        f"(failure #{state['agentmemory_failures']})"
+    )
+
+    if state["agentmemory_failures"] >= MAX_AGENTMEMORY_FAILURES:
+        log(f"*** restarting {AGENTMEMORY_CONTAINER} ***")
+        if restart_iii_engine_via_docker_socket():
+            state["agentmemory_failures"] = 0
+
+    return state
+
+
 
 
 # ── Health check ─────────────────────────────────────────────────────────────
@@ -265,11 +370,8 @@ def main():
     # ── Autonomous Indexer ──
     run_indexer(state)
 
-    mem_host = "host.docker.internal" if IN_DOCKER else "localhost"
-    if not IN_DOCKER and not port_open(AGENTMEMORY_PORT):
-        revive_agentmemory()
-    elif IN_DOCKER and not port_open(AGENTMEMORY_PORT, host=mem_host):
-        log(f"agentmemory port dark on {mem_host}")
+    # agentmemory: HTTP liveness + auto-restart of iii-engine container
+    state = check_agentmemory(state)
 
     save_state(state)
 

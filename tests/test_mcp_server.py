@@ -167,6 +167,66 @@ class TestAskPermission:
         self._call({})  # no tool_name
         assert "result" in patch_send[-1]  # should not crash
 
+    # MCP auth: when LEADAGENT_API_KEY is set, every HTTP call must carry
+    # X-LeadAgent-Key so GuardMiddleware does not reject it with 401.
+    def test_permission_request_includes_api_key_header(self, patch_send, monkeypatch):
+        monkeypatch.setattr(mcp, "_AUTH_HEADERS", {"X-LeadAgent-Key": "test-mcp-key"})
+
+        captured_post_kwargs = {}
+        captured_get_kwargs = {}
+
+        def fake_post(*args, **kwargs):
+            captured_post_kwargs.update(kwargs)
+            r = MagicMock()
+            r.json.return_value = {"id": "req-auth"}
+            r.raise_for_status = MagicMock()
+            return r
+
+        def fake_get(*args, **kwargs):
+            captured_get_kwargs.update(kwargs)
+            r = MagicMock()
+            r.json.return_value = {"behavior": "allow", "scope": "once"}
+            r.raise_for_status = MagicMock()
+            return r
+
+        monkeypatch.setattr("requests.post", fake_post)
+        monkeypatch.setattr("requests.get", fake_get)
+
+        self._call({"tool_name": "Bash", "input": {"command": "ls"}})
+
+        post_headers = captured_post_kwargs.get("headers", {})
+        get_headers = captured_get_kwargs.get("headers", {})
+        assert "X-LeadAgent-Key" in post_headers or "x-leadagent-key" in {k.lower() for k in post_headers}, (
+            "POST to /permission/_request must include X-LeadAgent-Key header"
+        )
+        assert "X-LeadAgent-Key" in get_headers or "x-leadagent-key" in {k.lower() for k in get_headers}, (
+            "GET to /permission/{id}/wait must include X-LeadAgent-Key header"
+        )
+
+    def test_no_api_key_env_sends_empty_auth_headers(self, patch_send, monkeypatch):
+        # When LEADAGENT_API_KEY is absent, _AUTH_HEADERS is {} and requests still
+        # succeed (no crash) — but callers must set the env var in production.
+        monkeypatch.setattr(mcp, "_AUTH_HEADERS", {})
+
+        def fake_post(*args, **kwargs):
+            r = MagicMock()
+            r.json.return_value = {"id": "req-nokey"}
+            r.raise_for_status = MagicMock()
+            return r
+
+        def fake_get(*args, **kwargs):
+            r = MagicMock()
+            r.json.return_value = {"behavior": "allow", "scope": "once"}
+            r.raise_for_status = MagicMock()
+            return r
+
+        monkeypatch.setattr("requests.post", fake_post)
+        monkeypatch.setattr("requests.get", fake_get)
+
+        self._call({"tool_name": "Bash", "input": {}})
+        # No crash; result is still returned
+        assert "result" in patch_send[-1]
+
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 

@@ -6,3 +6,4 @@ python-dotenv
 requests
 pexpect
 slack-bolt
+python-multipart

@@ -4,6 +4,8 @@ import threading
 import time
 import uuid
 
+from backend.security import scrub_secrets, is_blocked_entity
+
 
 class GraphDB:
     def __init__(self, db_path: str = "leadagent-data/db"):
@@ -31,12 +33,44 @@ class GraphDB:
         except Exception:
             pass
 
+    def _migrate_entity_composite_pk(self):
+        """Upgrade Entity table to use id=project_id:name as composite PK."""
+        try:
+            self.connection.execute("MATCH (e:Entity) RETURN e.id LIMIT 1")
+            return  # Already on new schema
+        except Exception as exc:
+            if "id" not in str(exc).lower() and "property" not in str(exc).lower():
+                return  # Unknown error — don't touch the schema
+        print("[DB Migration] Upgrading Entity table to composite PK (project_id:name). Existing entity data will be cleared.")
+        for stmt in ("DROP TABLE RELATED_TO", "DROP TABLE DEFINED_IN", "DROP TABLE ABOUT", "DROP TABLE Entity"):
+            try:
+                self.connection.execute(stmt)
+            except Exception:
+                pass
+        for stmt in (
+            "CREATE NODE TABLE Entity(id STRING, name STRING, type STRING, description STRING, "
+            "project_id STRING, confidence DOUBLE, last_seen DOUBLE, error_sourced BOOLEAN, "
+            "source_agent STRING, created_at DOUBLE, PRIMARY KEY (id))",
+            "CREATE REL TABLE RELATED_TO(FROM Entity TO Entity, type STRING, confidence DOUBLE)",
+            "CREATE REL TABLE DEFINED_IN(FROM Entity TO File)",
+            "CREATE REL TABLE ABOUT(FROM Question TO Entity)",
+        ):
+            try:
+                self.connection.execute(stmt)
+            except Exception:
+                pass
+        print("[DB Migration] Entity table upgraded.")
+
     def _init_schema(self):
         # Node tables — added project_id, confidence, last_seen for hygiene
+        # Entity uses a composite id = f"{project_id}:{name}" as PK to allow
+        # the same entity name to exist in multiple projects without collision.
         self._try_create(
-            "CREATE NODE TABLE Entity(name STRING, type STRING, description STRING, "
-            "project_id STRING, confidence DOUBLE, last_seen DOUBLE, error_sourced BOOLEAN, PRIMARY KEY (name))"
+            "CREATE NODE TABLE Entity(id STRING, name STRING, type STRING, description STRING, "
+            "project_id STRING, confidence DOUBLE, last_seen DOUBLE, error_sourced BOOLEAN, "
+            "source_agent STRING, created_at DOUBLE, PRIMARY KEY (id))"
         )
+        self._migrate_entity_composite_pk()
         self._try_create(
             "CREATE NODE TABLE Concept(name STRING, description STRING, "
             "project_id STRING, confidence DOUBLE, last_seen DOUBLE, PRIMARY KEY (name))"
@@ -97,6 +131,9 @@ class GraphDB:
         # Migrations
         self._try_alter("ALTER TABLE Entity ADD error_sourced BOOLEAN DEFAULT false")
         self._try_alter("ALTER TABLE Question ADD error_sourced BOOLEAN DEFAULT false")
+        self._try_alter("ALTER TABLE Question ADD session_id STRING DEFAULT 'default'")
+        self._try_alter("ALTER TABLE Entity ADD source_agent STRING DEFAULT ''")
+        self._try_alter("ALTER TABLE Entity ADD created_at DOUBLE DEFAULT 0.0")
 
     # ── write methods (all lock-protected) ──────────────────────────────────
 
@@ -150,36 +187,61 @@ class GraphDB:
                     f"MERGE (p)-[:{rel}]->(c)",
                     {"ppath": parent_path, "cpath": child_path},
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[link_filesystem] Error linking {parent_path} -> {child_path}: {e}")
 
     def add_entity(
-        self, name: str, type: str, description: str = "", project_id: str = "default", error_sourced: bool = False
+        self,
+        name: str,
+        type: str,
+        description: str = "",
+        source_project_id: str = "default",
+        error_sourced: bool = False,
+        auto_extracted: bool = False,
+        source_agent: str = "",
     ):
+        # Centralized brain-write guard: block sensitive names and scrub text on all paths.
+        if is_blocked_entity(name):
+            return
+        if source_project_id == "default":
+            name = scrub_secrets(name)
+            description = scrub_secrets(description)
+
+        # Auto-extracted entities start at 0.5 and need 5 corroborations to reach 1.0.
+        # Human-curated or indexer-written entities start at 1.0.
+        initial_confidence = 0.5 if auto_extracted else 1.0
         now = time.time()
+        entity_id = f"{source_project_id}:{name}"
         with self._lock:
             try:
-                # Try update first. If MATCH succeeds, SET will run.
+                # Try update first — match on composite id to avoid cross-project collisions.
                 res = self.connection.execute(
-                    "MATCH (e:Entity {name: $name}) "
-                    "SET e.last_seen = $now, e.confidence = COALESCE(e.confidence, 0.9) + 0.1, e.error_sourced = $es "
+                    "MATCH (e:Entity {id: $eid}) "
+                    "SET e.last_seen = $now, "
+                    "e.confidence = CASE WHEN e.confidence < 1.0 THEN e.confidence + 0.1 ELSE 1.0 END, "
+                    "e.error_sourced = $es "
                     "RETURN count(e)",
-                    {"name": name, "now": now, "es": error_sourced},
+                    {"eid": entity_id, "now": now, "es": error_sourced},
                 )
                 if res.has_next() and res.get_next()[0] > 0:
                     return
 
                 # If not found, create new
                 self.connection.execute(
-                    "CREATE (e:Entity {name: $name, type: $type, description: $description, "
-                    "project_id: $pid, confidence: 1.0, last_seen: $now, error_sourced: $es})",
+                    "CREATE (e:Entity {id: $eid, name: $name, type: $type, description: $description, "
+                    "project_id: $pid, confidence: $conf, last_seen: $now, error_sourced: $es, "
+                    "source_agent: $agent, created_at: $created})",
                     {
+                        "eid": entity_id,
                         "name": name,
                         "type": type,
                         "description": description,
-                        "pid": project_id,
+                        "pid": source_project_id,
+                        "conf": initial_confidence,
                         "now": now,
                         "es": error_sourced,
+                        "agent": source_agent,
+                        "created": now,
                     },
                 )
             except Exception as e:
@@ -188,6 +250,11 @@ class GraphDB:
     def add_concept(
         self, name: str, description: str = "", project_id: str = "default"
     ):
+        if is_blocked_entity(name):
+            return
+        if project_id == "default":
+            name = scrub_secrets(name)
+            description = scrub_secrets(description)
         with self._lock:
             try:
                 self.connection.execute(
@@ -203,41 +270,45 @@ class GraphDB:
             except Exception:
                 try:
                     self.connection.execute(
-                        "MATCH (c:Concept {name: $name}) SET c.last_seen = $now",
-                        {"name": name, "now": time.time()},
+                        "MATCH (c:Concept {name: $name, project_id: $pid}) SET c.last_seen = $now",
+                        {"name": name, "pid": project_id, "now": time.time()},
                     )
                 except Exception:
                     pass
 
     def add_relationship(
-        self, source: str, target: str, rel_type: str, confidence: float = 1.0
+        self, source: str, target: str, rel_type: str, confidence: float = 1.0, project_id: str = "default"
     ):
+        if is_blocked_entity(source) or is_blocked_entity(target):
+            return
+        if project_id == "default":
+            rel_type = scrub_secrets(rel_type)
         with self._lock:
             try:
                 self.connection.execute(
-                    "MATCH (a:Entity {name: $source}), (b:Entity {name: $target}) "
+                    "MATCH (a:Entity {id: $source_id}), (b:Entity {id: $target_id}) "
                     "MERGE (a)-[r:RELATED_TO {type: $rel_type}]->(b) "
                     "SET r.confidence = $conf",
                     {
-                        "source": source,
-                        "target": target,
+                        "source_id": f"{project_id}:{source}",
+                        "target_id": f"{project_id}:{target}",
                         "rel_type": rel_type,
                         "conf": confidence,
                     },
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[add_relationship] Error linking {source} -> {target}: {e}")
 
-    def link_entity_to_file(self, entity_name: str, file_path: str):
+    def link_entity_to_file(self, entity_name: str, file_path: str, project_id: str = "default"):
         with self._lock:
             try:
                 self.connection.execute(
-                    "MATCH (e:Entity {name: $ename}), (f:File {path: $fpath}) "
+                    "MATCH (e:Entity {id: $eid}), (f:File {path: $fpath}) "
                     "MERGE (e)-[:DEFINED_IN]->(f)",
-                    {"ename": entity_name, "fpath": file_path},
+                    {"eid": f"{project_id}:{entity_name}", "fpath": file_path},
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[link_entity_to_file] Error linking {entity_name} -> {file_path}: {e}")
 
     def prune_file(self, file_path: str):
         """Remove a file and any entities that were ONLY defined in that file."""
@@ -262,36 +333,31 @@ class GraphDB:
                 print(f"[prune_file] Error: {e}")
 
     def add_question(
-        self, prompt: str, answer: str, agent: str, project_id: str = "default", error_sourced: bool = False
+        self, prompt: str, answer: str, agent: str, source_project_id: str = "default", error_sourced: bool = False, session_id: str = "default"
     ) -> str:
         qid = str(uuid.uuid4())
+        # Scrub secrets from global-brain writes to prevent cross-project leakage.
+        if source_project_id == "default":
+            prompt = scrub_secrets(prompt)
+            answer = scrub_secrets(answer)
         with self._lock:
             try:
                 self.connection.execute(
                     "CREATE (q:Question {id: $id, prompt: $prompt, answer: $answer, "
-                    "agent: $agent, timestamp: $ts, project_id: $pid, error_sourced: $es})",
+                    "agent: $agent, timestamp: $ts, project_id: $pid, error_sourced: $es, session_id: $sid})",
                     {
                         "id": qid,
                         "prompt": prompt[:500],
                         "answer": answer[:1000],
                         "agent": agent,
                         "ts": time.time(),
-                        "pid": project_id,
+                        "pid": source_project_id,
                         "es": error_sourced,
+                        "sid": session_id,
                     },
                 )
-            except Exception:
-                # Fallback for old schema
-                self.connection.execute(
-                    "CREATE (q:Question {id: $id, prompt: $prompt, answer: $answer, agent: $agent, timestamp: $ts})",
-                    {
-                        "id": qid,
-                        "prompt": prompt[:500],
-                        "answer": answer[:1000],
-                        "agent": agent,
-                        "ts": time.time(),
-                    },
-                )
+            except Exception as e:
+                print(f"[add_question] Error: {e}")
         return qid
 
     # ── Memory Hygiene (Consensus Round 5) ──────────────────────────────────
@@ -332,15 +398,15 @@ class GraphDB:
 
         threading.Thread(target=_loop, daemon=True, name="MemoryJanitor").start()
 
-    def link_question_to_entity(self, question_id: str, entity_name: str):
+    def link_question_to_entity(self, question_id: str, entity_name: str, project_id: str = "default"):
         with self._lock:
             try:
                 self.connection.execute(
-                    "MATCH (q:Question {id: $qid}), (e:Entity {name: $ename}) CREATE (q)-[:ABOUT]->(e)",
-                    {"qid": question_id, "ename": entity_name},
+                    "MATCH (q:Question {id: $qid}), (e:Entity {id: $eid}) CREATE (q)-[:ABOUT]->(e)",
+                    {"qid": question_id, "eid": f"{project_id}:{entity_name}"},
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[link_question_to_entity] Error: {e}")
 
     def link_question_to_concept(self, question_id: str, concept_name: str):
         with self._lock:
@@ -349,8 +415,8 @@ class GraphDB:
                     "MATCH (q:Question {id: $qid}), (c:Concept {name: $cname}) CREATE (q)-[:DISCUSSES]->(c)",
                     {"qid": question_id, "cname": concept_name},
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[link_question_to_concept] Error: {e}")
 
     # ── Phase 1: Affinity & Errors ──────────────────────────────────────────
 

@@ -33,6 +33,15 @@ done
 # Helper: should we touch this service?
 wants() { [ ${#SERVICES[@]} -eq 0 ] || printf '%s\n' "${SERVICES[@]}" | grep -qx "$1"; }
 
+# ── Guard: auto-install on first run ─────────────────────────────────────────
+if [ ! -f ".installed" ]; then
+    echo "⚙️  LeadAgent is not installed yet — running setup first..."
+    MODE_FLAG=""
+    if [ "$FORCE_NATIVE" = true ]; then MODE_FLAG="--native"; fi
+    ./install.sh $MODE_FLAG
+    exit $?
+fi
+
 # Ensure runtime directories exist
 mkdir -p leadagent-data data
 
@@ -97,6 +106,8 @@ fi
 # Full-restart also cleans up anything else tagged as ours
 if [ ${#SERVICES[@]} -eq 0 ]; then
     echo "🧹 Cleaning up all LeadAgent processes..."
+    # Kill native iii/agentmemory processes that hold ports 3111/3112
+    pgrep -x iii 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     PIDS=$(pgrep -f "LEADAGENT_TAG=true" 2>/dev/null || true)
     if [ -n "$PIDS" ]; then
         for PID in $PIDS; do
@@ -112,33 +123,37 @@ export LEADAGENT_TAG=true
 
 # Load environment variables from .env if present
 if [ -f "backend/.env" ]; then
-    export $(grep -v '^#' backend/.env | xargs)
+    set -a
+    # shellcheck disable=SC1091
+    source backend/.env
+    set +a
 fi
 
 # Load workspace path from config.json
 CONFIG_FILE="leadagent-data/config.json"
-WORKSPACE="${LEADAGENT_WORKSPACE:-$HOME}"
+WORKSPACE=""
 if [ -f "$CONFIG_FILE" ]; then
     SAVED_PATH=$(grep -o '"projects_dir": "[^"]*' "$CONFIG_FILE" | cut -d'"' -f4)
     if [ -n "$SAVED_PATH" ]; then
         WORKSPACE="$SAVED_PATH"
     fi
 fi
+# Fall back to env var only if explicitly set by the user — never default to $HOME,
+# which would mirror the entire home directory before onboarding has run.
+if [ -z "$WORKSPACE" ] && [ -n "$LEADAGENT_WORKSPACE" ]; then
+    WORKSPACE="$LEADAGENT_WORKSPACE"
+fi
 export LEADAGENT_WORKSPACE="$WORKSPACE"
 
 # ── Service launchers ─────────────────────────────────────────────────────────
 
-start_agentmemory() {
-    if command -v agentmemory &>/dev/null; then
-        if ! nc -z localhost 3111 2>/dev/null; then
-            echo "   Starting agentmemory server..."
-            env LEADAGENT_TAG=true agentmemory serve --port 3111 --storage leadagent-data/memory &>leadagent-data/agentmemory.log &
-        else
-            echo "   agentmemory already running on port 3111."
-        fi
-    else
-        echo "   agentmemory not found — context memory will be limited."
+_ensure_ollama_model() {
+    local model="${LEADAGENT_OLLAMA_MODEL:-llama3.2:3b}"
+    if ollama list 2>/dev/null | grep -q "^${model} "; then
+        return 0
     fi
+    echo "   Pulling Ollama model '${model}' in background (first-time setup)..."
+    ollama pull "${model}" &>leadagent-data/ollama-pull.log &
 }
 
 start_ollama() {
@@ -150,35 +165,51 @@ start_ollama() {
         else
             echo "   Ollama already running on port 11434."
         fi
+        _ensure_ollama_model
     else
         echo "   Ollama not found on PATH. If it's the Mac App, please open it manually."
     fi
 }
 
 # ── Docker mode ───────────────────────────────────────────────────────────────
+_docker_ready() {
+    local i=0
+    while [ $i -lt 15 ]; do
+        docker info &>/dev/null && return 0
+        printf "   Waiting for Docker daemon... (%ds)\n" "$((i*2))"
+        sleep 2
+        i=$((i+1))
+    done
+    return 1
+}
 if [ "$FORCE_NATIVE" = false ] && docker info &>/dev/null; then
+    _docker_ready || { echo "⚠️  Docker daemon not ready after 30s — falling through to native mode."; }
     echo "🐳 Docker is running — starting LeadAgent via Docker Compose..."
-    echo "   Workspace mirrored: $LEADAGENT_WORKSPACE"
-
-    if wants agentmemory; then
-        start_agentmemory
+    if [ -n "$LEADAGENT_WORKSPACE" ]; then
+        echo "   Workspace mirrored: $LEADAGENT_WORKSPACE"
+    else
+        echo "   Workspace: not set (configure via onboarding)"
     fi
 
     if [ ${#SERVICES[@]} -eq 0 ]; then
-        # Full restart: rebuild everything
-        if wants agentmemory; then : ; else start_agentmemory; fi
         if ! nc -z localhost 11434 2>/dev/null; then
             echo "   Ollama not detected natively, will use Docker container..."
         fi
+        # Tear down first so stale containers don't block port binding
+        docker compose down --remove-orphans 2>/dev/null || true
         docker compose up -d --build
+        # Pull configured Ollama model if not already present (background, non-blocking)
+        _OLLAMA_MODEL="${LEADAGENT_OLLAMA_MODEL:-llama3.2:3b}"
+        if ! docker exec leadagent-ollama ollama list 2>/dev/null | grep -q "^${_OLLAMA_MODEL} "; then
+            echo "   Pulling Ollama model '${_OLLAMA_MODEL}' in background..."
+            docker exec leadagent-ollama ollama pull "${_OLLAMA_MODEL}" &>leadagent-data/ollama-pull.log &
+        fi
     else
-        # Selective: only act on named docker-compose services
         COMPOSE_SERVICES=()
         for svc in "${SERVICES[@]}"; do
             case "$svc" in
-                backend)     COMPOSE_SERVICES+=("backend") ;;
-                ollama)      COMPOSE_SERVICES+=("ollama") ;;
-                agentmemory) ;;   # handled natively above
+                backend) COMPOSE_SERVICES+=("backend") ;;
+                ollama)  COMPOSE_SERVICES+=("ollama") ;;
             esac
         done
         if [ ${#COMPOSE_SERVICES[@]} -gt 0 ]; then
@@ -196,12 +227,19 @@ if [ "$FORCE_NATIVE" = false ] && docker info &>/dev/null; then
 fi
 
 # ── Native fallback ───────────────────────────────────────────────────────────
-echo "⚠️  Docker not available — starting natively..."
+if [ "$FORCE_NATIVE" = true ]; then
+    echo "🖥️  Native mode — starting without Docker..."
+    # Tear down any running Docker stack so ports don't conflict
+    if docker info &>/dev/null 2>&1; then
+        docker compose down --remove-orphans 2>/dev/null || true
+    fi
+else
+    echo "⚠️  Docker not available — starting natively..."
+fi
 export PYTHONPATH=$PYTHONPATH:.
-export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.leadagent/bin:$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-if wants agentmemory; then start_agentmemory; fi
-if wants ollama;      then start_ollama;      fi
+if wants ollama; then start_ollama; fi
 
 if wants backend; then
     # Find venv python

@@ -17,6 +17,10 @@ import requests
 port = 8000 if os.environ.get("LEADAGENT_DOCKER_MODE") else 8001
 BACKEND_URL = os.environ.get("LEADAGENT_BACKEND_URL", f"http://localhost:{port}")
 SESSION_ID = os.environ.get("LEADAGENT_SESSION_ID", "default")
+PROJECT_ID = os.environ.get("LEADAGENT_PROJECT_ID", "default")
+_CWD = os.environ.get("LEADAGENT_WORKSPACE", ".")
+_API_KEY = os.environ.get("LEADAGENT_API_KEY", "")
+_AUTH_HEADERS = {"X-LeadAgent-Key": _API_KEY} if _API_KEY else {}
 
 _TOOLS = [
     {
@@ -75,6 +79,7 @@ def _evaluate_rule(tool_name: str) -> str:
         resp = requests.post(
             f"{BACKEND_URL}/rules/evaluate",
             json={"tool_name": tool_name, "input": {}, "agent": "mcp", "session_id": SESSION_ID},
+            headers=_AUTH_HEADERS,
             timeout=2,
         )
         if resp.ok:
@@ -96,8 +101,11 @@ def _call_agent(call: dict) -> str:
                 "prompt": call["prompt"],
                 "preferred_agent": call.get("agent"),
                 "task_type": call.get("task_type", "general"),
-                "session_id": f"{SESSION_ID}:subagent" # scoped session
+                "session_id": f"{SESSION_ID}:subagent",
+                "project_id": PROJECT_ID,
+                "cwd": _CWD,
             },
+            headers=_AUTH_HEADERS,
             timeout=120,
             stream=True
         )
@@ -163,7 +171,7 @@ def _handle(msg: dict) -> None:
         elif name == "memory_query":
             cypher = args.get("cypher", "")
             try:
-                resp = requests.post(f"{BACKEND_URL}/memory/query", json={"cypher": cypher}, timeout=10)
+                resp = requests.post(f"{BACKEND_URL}/memory/query", json={"cypher": cypher}, headers=_AUTH_HEADERS, timeout=10)
                 resp.raise_for_status()
                 res = resp.json()["result"]
                 _send({
@@ -182,7 +190,7 @@ def _handle(msg: dict) -> None:
             query = args.get("query", "")
             limit = args.get("limit", 5)
             try:
-                resp = requests.get(f"{BACKEND_URL}/v1/history", params={"session_id": SESSION_ID, "limit": limit}, timeout=10)
+                resp = requests.get(f"{BACKEND_URL}/v1/history", params={"session_id": SESSION_ID, "limit": limit}, headers=_AUTH_HEADERS, timeout=10)
                 resp.raise_for_status()
                 res = resp.json()
                 _send({

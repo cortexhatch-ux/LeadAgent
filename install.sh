@@ -26,8 +26,9 @@ ok()   { printf "  ${C_G}✓${C_R} %s\n" "$*"; }
 warn() { printf "  ${C_Y}!${C_R} %s\n" "$*"; }
 err()  { printf "  ${C_RED}✗${C_R} %s\n" "$*"; }
 
-printf "${C_B}🚀  Setting up LeadAgent${C_R}\n"
-printf "    project root: %s\n\n" "$PROJECT_ROOT"
+printf "${C_B}🚀  LeadAgent Setup & Start${C_R}\n"
+printf "    project root: %s\n" "$PROJECT_ROOT"
+printf "    (this is the only script you need to run)\n\n"
 
 if [ -z "$MODE" ]; then
     say "Choose your installation mode:"
@@ -56,11 +57,11 @@ for tool in python3 npm go; do
 done
 
 if [ "$MODE" = "docker" ]; then
-    if ! docker info >/dev/null 2>&1; then
-        err "Docker is required for --docker mode but it is not running."
-        exit 1
+    if docker info >/dev/null 2>&1; then
+        ok "docker: running"
+    else
+        warn "Docker is not running — install will continue, but you must start Docker before running start_backend.sh"
     fi
-    ok "docker: running"
 fi
 
 if [ ${#missing[@]} -gt 0 ]; then
@@ -104,7 +105,7 @@ ok "Python dependencies installed"
 if [ "$MODE" = "native" ]; then
     say "Installing AI CLIs into $NPM_PREFIX"
     mkdir -p "$NPM_PREFIX"
-    for pkg in "@anthropic-ai/claude-code" "@google/gemini-cli" "@openai/codex"; do
+    for pkg in "@anthropic-ai/claude-code" "@google/gemini-cli" "@openai/codex" "@agentmemory/agentmemory"; do
         printf "  installing %s ..." "$pkg"
         if npm install -g --silent --prefix "$NPM_PREFIX" "$pkg" >/dev/null 2>&1; then
             printf " ${C_G}done${C_R}\n"
@@ -223,12 +224,47 @@ PLIST
 fi
 
 # ─── 7. Finalize ─────────────────────────────────────────────────────────────
+touch .installed
+
 echo
 say "Starting LeadAgent backend daemon..."
 START_FLAGS="--daemon"
 if [ "$MODE" = "native" ]; then
     START_FLAGS="$START_FLAGS --native"
+elif ! docker info >/dev/null 2>&1; then
+    echo "⚠️  Docker is not running — skipping backend start. Run ./start_backend.sh once Docker is up."
+    echo
+    printf "${C_B}🎉  Setup complete!${C_R}\n"
+    echo "  Start Docker Desktop, then run:  ./start_backend.sh"
+    exit 0
 fi
+
+# ─── agentmemory (one-time Docker stack setup) ───────────────────────────────
+# agentmemory manages its own Docker stack (iii-engine). Start it here during
+# install so start_backend.sh never needs to touch it — the watchdog keeps it
+# alive after this point.
+if [ "$MODE" != "native" ] && command -v docker >/dev/null 2>&1; then
+    AGENTMEMORY_COMPOSE_DIR=""
+    for _candidate in \
+        "$(npm root -g 2>/dev/null)/@agentmemory/agentmemory" \
+        "$HOME/.nvm/versions/node/$(node --version 2>/dev/null)/lib/node_modules/@agentmemory/agentmemory" \
+        "/usr/local/lib/node_modules/@agentmemory/agentmemory"; do
+        if [ -f "$_candidate/docker-compose.yml" ]; then
+            AGENTMEMORY_COMPOSE_DIR="$_candidate"
+            break
+        fi
+    done
+    if [ -n "$AGENTMEMORY_COMPOSE_DIR" ]; then
+        say "Starting agentmemory (iii-engine)..."
+        _OVERRIDE="$HOME/.agentmemory/docker-compose.override.yml"
+        _COMPOSE_ARGS="-f $AGENTMEMORY_COMPOSE_DIR/docker-compose.yml"
+        [ -f "$_OVERRIDE" ] && _COMPOSE_ARGS="$_COMPOSE_ARGS -f $_OVERRIDE"
+        docker compose $_COMPOSE_ARGS up -d --remove-orphans >/dev/null 2>&1 && ok "agentmemory started" || warn "agentmemory failed to start — check docker logs agentmemory-iii-engine-1"
+    else
+        warn "agentmemory npm package not found — skipping (run: npm install -g @agentmemory/agentmemory)"
+    fi
+fi
+
 ./start_backend.sh $START_FLAGS
 
 say "Launching onboarding wizard..."
@@ -244,7 +280,10 @@ echo "  Reload your shell:  source $SHELL_RC"
 echo "  Use 'leadagent' from any project folder."
 echo
 echo "Useful commands:"
+echo "  ./install.sh              — install or restart everything"
+echo "  ./start_backend.sh        — restart services (runs install if needed)"
 echo "  leadagent doctor          — full environment check"
 echo "  leadagent health          — backend status"
-echo "  tail -f data/daemon.log   — backend logs"
+echo "  tail -f leadagent-data/agentmemory.log  — primary memory logs"
+echo "  tail -f leadagent-data/daemon.log        — backend logs"
 printf "${C_C}────────────────────────────────────────────────${C_R}\n"

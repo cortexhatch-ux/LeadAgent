@@ -38,14 +38,77 @@ type ChatRequest struct {
 	SessionID      string `json:"session_id,omitempty"`
 	CWD            string `json:"cwd,omitempty"`
 	Parallel       bool   `json:"parallel,omitempty"`
+	ProjectID      string `json:"project_id,omitempty"`
+	MemoryScope    string `json:"memory_scope,omitempty"`
 }
 
 type DebateRequest struct {
-	Prompt string   `json:"prompt"`
-	Rounds int      `json:"rounds"`
-	Agents []string `json:"agents,omitempty"`
-	CWD    string   `json:"cwd,omitempty"`
-	Force  bool     `json:"force,omitempty"`
+	Prompt    string   `json:"prompt"`
+	Rounds    int      `json:"rounds"`
+	Agents    []string `json:"agents,omitempty"`
+	CWD       string   `json:"cwd,omitempty"`
+	Force     bool     `json:"force,omitempty"`
+	ProjectID string   `json:"project_id,omitempty"`
+}
+
+// loadAPIKey reads the LeadAgent API key from leadagent-data/config.json.
+// Returns "" if the file does not exist or the key is not set.
+func loadAPIKey() string {
+	// Walk up from the executable's directory looking for leadagent-data/config.json
+	candidates := []string{
+		filepath.Join(findProjectRoot(), "leadagent-data", "config.json"),
+	}
+	// Also check the directory of the running binary
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "..", "leadagent-data", "config.json"))
+	}
+	for _, p := range candidates {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var cfg map[string]interface{}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
+		if key, ok := cfg["api_key"].(string); ok && key != "" {
+			return key
+		}
+	}
+	return ""
+}
+
+// apiRequest creates an authenticated HTTP request to the backend.
+func apiRequest(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if key := loadAPIKey(); key != "" {
+		req.Header.Set("X-LeadAgent-Key", key)
+	}
+	return req, nil
+}
+
+// apiPost performs an authenticated POST to the backend.
+func apiPost(client *http.Client, url string, body []byte) (*http.Response, error) {
+	req, err := apiRequest(context.Background(), http.MethodPost, url, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
+
+// apiGet performs an authenticated GET from the backend.
+func apiGet(client *http.Client, url string) (*http.Response, error) {
+	req, err := apiRequest(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
 }
 
 func backendURL() string {
@@ -334,15 +397,7 @@ func runSetupWizard() {
 		}
 	}
 	if python == "" {
-		for _, p := range []string{"python3", "python"} {
-			if path, err := exec.LookPath(p); err == nil {
-				python = path
-				break
-			}
-		}
-	}
-	if python == "" {
-		fmt.Printf("%s⚠️  Python 3 not found — run backend/setup_wizard.py manually to complete setup.%s\n", Yellow, Reset)
+		fmt.Printf("%s⚠️  LeadAgent venv not found — run ./install.sh first to set up dependencies.%s\n", Yellow, Reset)
 		return
 	}
 	wizard := filepath.Join(root, "backend", "setup_wizard.py")
@@ -358,7 +413,7 @@ func runSetupWizard() {
 	cmd.Run()
 }
 
-var version = "0.6.0"
+var version = "0.7.0"
 
 func printVersion() {
 	rev, dirty := "", ""
@@ -527,13 +582,14 @@ func initProject() {
 	cwd, _ := os.Getwd()
 	reqBody := map[string]string{"path": cwd}
 	jsonData, _ := json.Marshal(reqBody)
-	http.Post(backendURL() + "/project/init", "application/json", bytes.NewBuffer(jsonData))
+	client := &http.Client{Timeout: 5 * time.Second}
+	apiPost(client, backendURL()+"/project/init", jsonData) //nolint:errcheck
 }
 
 func isBackendUp() bool {
 	// Increased timeout to 2s to account for Docker networking overhead
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(backendURL() + "/health")
+	resp, err := apiGet(client, backendURL()+"/health")
 	if err != nil {
 		return false
 	}
@@ -837,6 +893,7 @@ func startREPL() {
 			fmt.Printf(" %s/roles%s                 List all roles with descriptions\n", Cyan, Reset)
 			fmt.Printf(" %s/health%s                Show daemon health & agent availability\n", Cyan, Reset)
 			fmt.Printf(" %s/doctor%s                Run full environment diagnostic\n", Cyan, Reset)
+			fmt.Printf(" %s/login [agent]%s         Re-authenticate an agent (claude, gemini, codex, grok) or all signed-out\n", Cyan, Reset)
 			fmt.Printf(" %s/debate [--rounds N] [--no-context] <topic>%s  Multi-agent debate\n", Cyan, Reset)
 			fmt.Printf(" %s/forget%s                Clear stale project knowledge & cache\n", Cyan, Reset)
 			fmt.Printf(" %s(nc) <msg>%s             Run query without project context\n", Cyan, Reset)
@@ -854,7 +911,8 @@ func startREPL() {
 				"project_id": projectID,
 			}
 			jsonData, _ := json.Marshal(reqBody)
-			resp, err := http.Post(backendURL() + "/memory/forget", "application/json", bytes.NewBuffer(jsonData))
+			forgotClient := &http.Client{Timeout: 10 * time.Second}
+			resp, err := apiPost(forgotClient, backendURL()+"/memory/forget", jsonData)
 			if err != nil {
 				fmt.Printf("\n%s❌ Error connecting to LeadAgent daemon: %v%s\n", Red, err, Reset)
 				continue
@@ -880,6 +938,11 @@ func startREPL() {
 
 		if trimmed == "/doctor" {
 			handleDoctor()
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "/login") {
+			handleReplLogin(strings.TrimSpace(strings.TrimPrefix(trimmed, "/login")))
 			continue
 		}
 
@@ -1007,7 +1070,7 @@ func drawDashboard() {
 	client := &http.Client{Timeout: 2 * time.Second}
 	var health HealthResponse
 	backendOnline := false
-	resp, err := client.Get(backendURL() + "/health")
+	resp, err := apiGet(client, backendURL()+"/health")
 	if err == nil {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
@@ -1110,7 +1173,8 @@ func getAgentColor(agent string) string {
 }
 
 func printRoles() {
-	resp, err := http.Get(backendURL() + "/roles")
+	rolesClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := apiGet(rolesClient, backendURL()+"/roles")
 	if err != nil {
 		fmt.Printf("%s  Could not fetch roles from daemon.%s\n\n", Red, Reset)
 		return
@@ -1311,10 +1375,7 @@ func (kl *keyListener) Close() {
 
 func postInterrupt(sessionID string) {
 	client := &http.Client{Timeout: 5 * time.Second}
-	client.Post(
-		fmt.Sprintf(backendURL() + "/permission/interrupt/%s", sessionID),
-		"application/json", nil,
-	)
+	apiPost(client, fmt.Sprintf(backendURL()+"/permission/interrupt/%s", sessionID), nil) //nolint:errcheck
 }
 
 // readLineKeys reads a line byte-by-byte with manual echo (terminal echo is
@@ -1460,14 +1521,11 @@ func handlePermissionRequest(rawJSON string, getKey func() byte) {
 	}
 	decJSON, _ := json.Marshal(decBody)
 	client := &http.Client{Timeout: 5 * time.Second}
-	client.Post(
-		fmt.Sprintf(backendURL() + "/permission/%s/decide", pr.ID),
-		"application/json",
-		bytes.NewBuffer(decJSON),
-	)
+	apiPost(client, fmt.Sprintf(backendURL()+"/permission/%s/decide", pr.ID), decJSON) //nolint:errcheck
 }
 
 func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd string) string {
+	projectID := filepath.Base(findProjectRoot())
 	reqBody := ChatRequest{
 		Prompt:         prompt,
 		TaskType:       taskType,
@@ -1475,6 +1533,8 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 		SessionID:      sessionID,
 		CWD:            cwd,
 		Parallel:       parallel,
+		ProjectID:      projectID,
+		MemoryScope:    "shared",
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -1492,13 +1552,12 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 		setRequestCancel(nil)
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, backendURL() + "/chat", bytes.NewBuffer(jsonData))
+	req, err := apiRequest(ctx, http.MethodPost, backendURL()+"/chat", bytes.NewBuffer(jsonData))
 	if err != nil {
 		stopSpinner()
 		fmt.Printf("%s  Error building request: %v%s\n", Red, err, Reset)
 		return ""
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1762,11 +1821,12 @@ func sendChat(prompt, taskType, agent, sessionID string, parallel bool, cwd stri
 
 func sendDebate(prompt string, rounds int, agents []string, cwd string, force bool) {
 	reqBody := DebateRequest{
-		Prompt: prompt,
-		Rounds: rounds,
-		Agents: agents,
-		CWD:    cwd,
-		Force:  force,
+		Prompt:    prompt,
+		Rounds:    rounds,
+		Agents:    agents,
+		CWD:       cwd,
+		Force:     force,
+		ProjectID: filepath.Base(findProjectRoot()),
 	}
 	jsonData, _ := json.Marshal(reqBody)
 
@@ -1777,12 +1837,11 @@ func sendDebate(prompt string, rounds int, agents []string, cwd string, force bo
 		setRequestCancel(nil)
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, backendURL() + "/debate", bytes.NewBuffer(jsonData))
+	req, err := apiRequest(ctx, http.MethodPost, backendURL()+"/debate", bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Printf("%s❌ Error building debate request: %v%s\n", Red, err, Reset)
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1994,7 +2053,8 @@ func statusDot(ok bool) string {
 }
 
 func handleHealth() {
-	resp, err := http.Get(backendURL() + "/health")
+	healthClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := apiGet(healthClient, backendURL()+"/health")
 	if err != nil {
 		fmt.Printf("\n%s%s┌─────────────────────────────────────────┐%s\n", Bold, Cyan, Reset)
 		fmt.Printf("%s%s│         %s⚠️  SYSTEM OFFLINE             %s%s│%s\n", Bold, Cyan, Yellow, Bold, Cyan, Reset)
@@ -2093,6 +2153,91 @@ func handleHealth() {
 	}
 	fmt.Printf("%s%s└─────────────────────────────────────────┘%s\n\n", Bold, Cyan, Reset)
 }
+var agentLoginCmds = map[string][]string{
+	"claude": {"claude", "auth", "login"},
+	"gemini": {"agy"},
+	"codex":  {"codex", "login", "--device-auth"},
+	"grok":   {"grok", "login"},
+}
+
+var agentContainers = map[string]string{
+	"claude": "leadagent-claude",
+	"gemini": "leadagent-gemini",
+	"codex":  "leadagent-codex",
+	"grok":   "leadagent-grok",
+}
+
+func buildLoginCmd(name string, loginArgs []string) []string {
+	container, ok := agentContainers[name]
+	if !ok {
+		return loginArgs
+	}
+	res, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", container).Output()
+	if err != nil || strings.TrimSpace(string(res)) != "true" {
+		return loginArgs
+	}
+	return append([]string{"docker", "exec", "-it", container}, loginArgs...)
+}
+
+func handleReplLogin(agent string) {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+
+	run := func(name string, loginArgs []string) {
+		cmdArgs := buildLoginCmd(name, loginArgs)
+		if len(cmdArgs) > len(loginArgs) {
+			fmt.Printf("\n%s▶ Signing in to %s (via container %s)...%s\n", Cyan+Bold, name, agentContainers[name], Reset)
+		} else {
+			fmt.Printf("\n%s▶ Signing in to %s...%s\n", Cyan+Bold, name, Reset)
+		}
+		cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("%s✗ Login failed for %s: %v%s\n", Red, name, err, Reset)
+		} else {
+			fmt.Printf("%s✓ Signed in to %s%s\n\n", Green, name, Reset)
+			drawDashboard()
+		}
+	}
+
+	if agent == "" {
+		// Login all agents that are signed-out according to health endpoint
+		client := &http.Client{Timeout: 4 * time.Second}
+		resp, err := apiGet(client, backendURL()+"/v1/status")
+		if err == nil {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			var h HealthResponse
+			if json.Unmarshal(body, &h) == nil {
+				ran := false
+				for _, name := range []string{"claude", "gemini", "codex", "grok"} {
+					ag := h.Components.Agents[name]
+					if ag.Installed && ag.SignedIn != nil && !*ag.SignedIn {
+						if cmds, ok := agentLoginCmds[name]; ok {
+							run(name, cmds)
+							ran = true
+						}
+					}
+				}
+				if !ran {
+					fmt.Printf("%sNo agents need re-authentication.%s\n", Gray, Reset)
+				}
+				return
+			}
+		}
+		fmt.Printf("%sBackend offline — specify agent name: /login claude%s\n", Yellow, Reset)
+		return
+	}
+
+	cmds, ok := agentLoginCmds[agent]
+	if !ok {
+		fmt.Printf("%sUnknown agent '%s'. Valid: claude, gemini, codex, grok%s\n", Red, agent, Reset)
+		return
+	}
+	run(agent, cmds)
+}
+
 func handleAuth() {
 	fmt.Printf("\n%sLeadAgent uses subscription CLIs — no API keys needed.%s\n", Bold+Yellow, Reset)
 	fmt.Printf("Log in to each CLI directly:\n")
@@ -2127,7 +2272,7 @@ func handleDoctor() {
 
 	// Backend-side full doctor.
 	client := &http.Client{Timeout: 6 * time.Second}
-	resp, err := client.Get(backendURL() + "/doctor")
+	resp, err := apiGet(client, backendURL()+"/doctor")
 	if err != nil {
 		printDoctorRow("backend", false, "offline — start with ./start_backend.sh")
 		fmt.Printf("%s%s╰────────────────────────────────────────────╯%s\n\n", Bold, Cyan, Reset)
@@ -2182,8 +2327,8 @@ func printDoctorRow(name string, ok bool, detail string) {
 func handleQuery(cypher string) {
 	reqBody := map[string]string{"cypher": cypher}
 	jsonData, _ := json.Marshal(reqBody)
-
-	resp, err := http.Post(backendURL() + "/memory/query", "application/json", bytes.NewBuffer(jsonData))
+	queryClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := apiPost(queryClient, backendURL()+"/memory/query", jsonData)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return

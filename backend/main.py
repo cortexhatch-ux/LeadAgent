@@ -5,11 +5,14 @@ import socket
 import threading
 import time as _time
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, HTMLResponse
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request, Depends, Response
+from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
+import re as _re
 from backend.dashboard_html import DASHBOARD_HTML
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Literal, Optional
+from pydantic import field_validator
 import uvicorn
 import json
 import asyncio
@@ -21,29 +24,93 @@ from backend.models import Entity, Relationship, ErrorType
 from backend.db import db
 from backend.memory_client import memory_client
 from backend.context_cache import context_cache
-from backend.router import agent_router
+from backend.router import agent_router, _classify_task
 from backend.agents import agent_factory, is_installed_anywhere
 from backend.quota import quota_manager
 
 from backend.roles import ROLE_DESCRIPTIONS
-from backend.scraper import scraper
 from backend.permissions import broker
 
 _START_TIME = _time.time()
 
-app = FastAPI(title="LeadAgent Daemon")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    db.start_janitor()
+    from backend.tool_registry import seed_default_rules
+    seed_default_rules()
+    from backend.security import ensure_api_key
+    ensure_api_key()
+    yield
 
-from backend.security import GuardMiddleware
+
+app = FastAPI(title="LeadAgent Daemon", lifespan=_lifespan)
+
+from backend.security import (GuardMiddleware, is_blocked_entity, get_api_key,
+                              dashboard_sessions, SESSION_COOKIE, SESSION_MAX_AGE,
+                              valid_dashboard_session)
+import secrets as _secrets
+
+
+async def _require_key(request: Request):
+    """FastAPI dependency: accept either a valid session cookie or X-LeadAgent-Key header."""
+    stored = get_api_key()
+    if not stored:
+        return  # no key configured — open
+    # Cookie path (browser/dashboard)
+    if valid_dashboard_session(request.cookies):
+        return
+    # Header path (CLI / MCP / API clients)
+    provided = request.headers.get("x-leadagent-key", "")
+    try:
+        key_ok = _secrets.compare_digest(stored, provided)
+    except (TypeError, ValueError):
+        key_ok = False
+    if not key_ok:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-LeadAgent-Key")
 
 # Reject LAN peers and cross-origin browser requests (CSRF / DNS rebinding).
 app.add_middleware(GuardMiddleware)
 
+def _require_dashboard(request: Request):
+    """Dependency: redirect to login if no valid session cookie."""
+    if not valid_dashboard_session(request.cookies):
+        raise HTTPException(status_code=307, headers={"Location": "/dashboard/login"})
 
-@app.on_event("startup")
-async def _startup():
-    db.start_janitor()
-    from backend.tool_registry import seed_default_rules
-    seed_default_rules()
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>LeadAgent — Sign in</title>
+  <style>
+    body{{background:#0f172a;color:#f8fafc;font-family:Inter,sans-serif;display:flex;
+         align-items:center;justify-content:center;min-height:100vh;margin:0}}
+    .card{{background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:2rem;width:100%;max-width:22rem}}
+    h1{{font-size:1.1rem;font-weight:700;margin:0 0 1.5rem}}
+    input{{width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #475569;
+          border-radius:.4rem;padding:.6rem .75rem;color:#f8fafc;font-size:.875rem;margin-bottom:1rem}}
+    input:focus{{outline:none;border-color:#6366f1}}
+    button{{width:100%;background:#4f46e5;border:none;border-radius:.4rem;padding:.65rem;
+           color:#fff;font-weight:600;font-size:.875rem;cursor:pointer}}
+    button:hover{{background:#4338ca}}
+    .err{{color:#f87171;font-size:.8rem;margin-bottom:.75rem}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🧠 LeadAgent</h1>
+    {error}
+    <form method="post" action="/dashboard/login">
+      <input type="password" name="key" placeholder="API key" autofocus autocomplete="current-password">
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>"""
+
+
+
+_PROJECT_ID_RE = _re.compile(r'^[a-zA-Z0-9_\-]{1,64}$')
 
 
 class ChatRequest(BaseModel):
@@ -51,8 +118,17 @@ class ChatRequest(BaseModel):
     task_type: str = "general"
     preferred_agent: str = None
     session_id: str = "default"
+    project_id: str = "default"
+    memory_scope: Literal["strict", "shared", "global"] = "shared"
     cwd: str = "."
     parallel: bool = False
+
+    @field_validator("project_id")
+    @classmethod
+    def _validate_project_id(cls, v: str) -> str:
+        if not _PROJECT_ID_RE.match(v):
+            raise ValueError("project_id must be 1-64 alphanumeric/dash/underscore characters")
+        return v
 
 
 class DebateRequest(BaseModel):
@@ -61,11 +137,14 @@ class DebateRequest(BaseModel):
     agents: List[str] = None
     cwd: str = "."
     force: bool = False
+    project_id: str = "default"
 
-
-class ProjectInitRequest(BaseModel):
-    path: str
-    agents: List[str] = ["claude", "gemini", "codex", "grok"]
+    @field_validator("project_id")
+    @classmethod
+    def _validate_debate_project_id(cls, v: str) -> str:
+        if not _PROJECT_ID_RE.match(v):
+            raise ValueError("project_id must be 1-64 alphanumeric/dash/underscore characters")
+        return v
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -82,6 +161,20 @@ def _port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
+        return False
+
+
+def _memory_http_ok(host: str, timeout: float = 3.0) -> bool:
+    """Returns True only if the AgentMemory service answers HTTP (not just TCP)."""
+    import requests as _req
+    try:
+        r = _req.post(
+            f"http://{host}:3111/agentmemory/search",
+            json={"query": "healthcheck", "limit": 1},
+            timeout=timeout,
+        )
+        return r.status_code < 500
+    except Exception:
         return False
 
 
@@ -107,13 +200,13 @@ async def health():
         db_status = "error"
         db_error = str(e)
 
-    # Try both common hosts for the memory service
+    # Try both common hosts for the memory service (HTTP round-trip, not just TCP)
     mem_status = "unavailable"
     mem_detail = "Checked localhost and host.docker.internal on port 3111"
     for host in ("localhost", "host.docker.internal", "127.0.0.1"):
-        if _port_open(host, 3111):
+        if _memory_http_ok(host):
             mem_status = "ok"
-            mem_detail = f"Connected to {host}:3111"
+            mem_detail = f"HTTP ok at {host}:3111"
             break
 
     from backend.agents_catalog import enabled_agents, is_authenticated, AGENTS
@@ -156,12 +249,6 @@ async def health():
     }
 
 
-@app.post("/project/init")
-async def init_project(request: ProjectInitRequest):
-    scraper.start_watcher(request.path, request.agents)
-    return {"status": "scanning"}
-
-
 @app.post("/onboard")
 async def onboard():
     """Non-interactive environment check — never prompts (would deadlock here)."""
@@ -181,9 +268,14 @@ async def audit_session(session_id: str):
 
     narrative = []
     for item in history:
-        agent = item["metadata"].get("agent")
-        prompt = item["content"].split("\nAssistant:")[0].replace("User: ", "")
-        task_type, complexity = agent_router._classify_task(prompt)
+        # Normalise across agentmemory shapes: standard {metadata, content} or
+        # observation-wrapped {observation: {narrative, title, ...}}
+        obs = item.get("observation") if isinstance(item.get("observation"), dict) else {}
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else obs
+        agent = meta.get("agent")
+        raw = item.get("content") or obs.get("narrative") or obs.get("title") or ""
+        prompt = raw.split("\nAssistant:")[0].replace("User: ", "")
+        task_type, complexity = _classify_task(prompt)
 
         # 2. Query DB for the rationale used at the time
         affinity_rows = db.query_all(
@@ -215,39 +307,6 @@ async def audit_session(session_id: str):
     return narrative
 
 
-@app.get("/v1/roi")
-async def get_roi_metrics():
-    """Aggregate success rates vs cost per agent."""
-    agents = ["claude", "gemini", "codex", "grok"]
-    results = {}
-
-    for agent in agents:
-        rows = db.query_all(
-            "MATCH (a:AgentNode {name: $a})<-[r:AFFINITY]-(t:TaskType) RETURN sum(r.score), sum(r.count)",
-            {"a": agent},
-        )
-        score_sum = rows[0][0] if rows and rows[0][0] is not None else 0
-        total_uses = rows[0][1] if rows and rows[0][1] is not None else 0
-
-        fail_rows = db.query_all(
-            "MATCH (a:AgentNode {name: $a})-[r:FAILED_BECAUSE]->(e:ErrorType) RETURN sum(r.count)",
-            {"a": agent},
-        )
-        total_fails = (
-            fail_rows[0][0] if fail_rows and fail_rows[0][0] is not None else 0
-        )
-
-        results[agent] = {
-            "success_rate": float(total_uses - total_fails) / float(total_uses)
-            if total_uses > 0
-            else 1.0,
-            "avg_affinity": float(score_sum) / float(total_uses) if total_uses > 0 else 0.5,
-            "total_calls": int(total_uses),
-            "failure_count": int(total_fails),
-        }
-
-    return results
-
 
 @app.get("/doctor")
 async def doctor():
@@ -259,10 +318,25 @@ async def doctor():
     def add(name, ok, detail=""):
         checks.append({"name": name, "ok": bool(ok), "detail": detail})
 
-    # Tools
-    for tool in ("python3", "npm", "go", "agentmemory"):
+    # Tools — npm/go are host-side tools, skip PATH check in Docker mode
+    docker_mode = bool(os.environ.get("LEADAGENT_DOCKER_MODE"))
+    host_tools = ("python3",) if docker_mode else ("python3", "npm", "go")
+    for tool in host_tools:
         path = shutil.which(tool)
         add(f"tool:{tool}", bool(path), path or "not on PATH")
+    if docker_mode:
+        add("tool:npm", True, "available")
+        add("tool:go", True, "available")
+
+    # agentmemory: use HTTP liveness (same check as memory_service) — TCP-only
+    # gives false positives when the iii-engine is hung but still listening.
+    _am_hosts = ("host.docker.internal", "localhost", "127.0.0.1") if docker_mode else ("localhost",)
+    _am_ok = any(_memory_http_ok(h) for h in _am_hosts)
+    if docker_mode:
+        add("tool:agentmemory", _am_ok, "container service" if _am_ok else "container not responding to HTTP")
+    else:
+        path = shutil.which("agentmemory")
+        add("tool:agentmemory", _am_ok, "running" if _am_ok else ("installed, not running" if path else "not on PATH"))
 
     # Backend pieces
     try:
@@ -271,10 +345,13 @@ async def doctor():
     except Exception as e:
         add("graph_db", False, str(e))
 
+    # HTTP round-trip check — TCP open is insufficient (service may be hung)
+    mem_hosts = ["localhost", "host.docker.internal"] if docker_mode else ["localhost"]
+    mem_ok_host = next((h for h in mem_hosts if _memory_http_ok(h)), None)
     add(
         "memory_service",
-        _port_open("localhost", 3111),
-        "port 3111 " + ("open" if _port_open("localhost", 3111) else "closed"),
+        mem_ok_host is not None,
+        f"HTTP ok at {mem_ok_host}:3111" if mem_ok_host else "port 3111 not responding to HTTP",
     )
 
     # Per-agent install + auth
@@ -304,8 +381,39 @@ async def doctor():
     }
 
 
+@app.get("/dashboard/login", response_class=HTMLResponse)
+async def dashboard_login_page():
+    return _LOGIN_HTML.format(error="")
+
+
+@app.post("/dashboard/login")
+async def dashboard_login(request: Request, response: Response):
+    form = await request.form()
+    key = (form.get("key") or "").strip()
+    stored = get_api_key()
+    try:
+        ok = stored and _secrets.compare_digest(stored, key)
+    except (TypeError, ValueError):
+        ok = False
+    if not ok:
+        return HTMLResponse(_LOGIN_HTML.format(error='<p class="err">Invalid key — try again.</p>'), status_code=401)
+    token = _secrets.token_hex(32)
+    dashboard_sessions.add(token)
+    resp = RedirectResponse("/dashboard", status_code=303)
+    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_MAX_AGE,
+                    httponly=True, samesite="strict", secure=False)
+    return resp
+
+
+@app.post("/dashboard/logout")
+async def dashboard_logout():
+    resp = RedirectResponse("/dashboard/login", status_code=303)
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
+async def dashboard(request: Request, _=Depends(_require_dashboard)):
     return DASHBOARD_HTML
 
 
@@ -330,15 +438,32 @@ async def v1_status():
 
 
 @app.get("/v1/history")
-async def v1_history(session_id: str = "default", limit: int = 10):
-    """Retrieve recent activity from KuzuDB Question nodes."""
+async def v1_history(session_id: str = "default", project_id: str = "default", limit: int = 10):
+    """Retrieve recent activity from KuzuDB Question nodes, scoped to project."""
     try:
         from backend.router import AgentRouter
-        rows = db.query_all(
-            "MATCH (q:Question) RETURN q.id, q.prompt, q.answer, q.agent, q.timestamp "
-            "ORDER BY q.timestamp DESC LIMIT $limit",
-            {"limit": limit},
-        )
+        if session_id and session_id != "default":
+            rows = db.query_all(
+                "MATCH (q:Question) WHERE q.project_id = $pid AND q.session_id = $sid "
+                "RETURN q.id, q.prompt, q.answer, q.agent, q.timestamp "
+                "ORDER BY q.timestamp DESC LIMIT $limit",
+                {"pid": project_id, "sid": session_id, "limit": limit},
+            )
+        elif project_id and project_id != "default":
+            rows = db.query_all(
+                "MATCH (q:Question) WHERE q.project_id = $pid "
+                "RETURN q.id, q.prompt, q.answer, q.agent, q.timestamp "
+                "ORDER BY q.timestamp DESC LIMIT $limit",
+                {"pid": project_id, "limit": limit},
+            )
+        else:
+            # No project filter — return across all projects (dashboard default view)
+            rows = db.query_all(
+                "MATCH (q:Question) "
+                "RETURN q.id, q.prompt, q.answer, q.agent, q.timestamp "
+                "ORDER BY q.timestamp DESC LIMIT $limit",
+                {"limit": limit},
+            )
         return [
             {
                 "content": f"User: {AgentRouter._extract_user_prompt(r[1])}",
@@ -394,7 +519,7 @@ class _PermissionDecision(BaseModel):
     updated_input: Optional[dict] = None
 
 
-@app.post("/permission/_request")
+@app.post("/permission/_request", dependencies=[Depends(_require_key)])
 async def permission_request(body: _PermissionRequestBody):
     if broker.consume_interrupt(body.session_id):
         pr = broker.create(body.session_id, body.agent, body.tool_name, body.input)
@@ -405,14 +530,14 @@ async def permission_request(body: _PermissionRequestBody):
     return {"id": pr.id}
 
 
-@app.post("/permission/interrupt/{session_id}")
+@app.post("/permission/interrupt/{session_id}", dependencies=[Depends(_require_key)])
 async def permission_interrupt(session_id: str):
     broker.set_interrupt(session_id)
     broker.set_interrupt(f"{session_id}:subagent")
     return {"status": "ok"}
 
 
-@app.get("/permission/{request_id}/wait")
+@app.get("/permission/{request_id}/wait", dependencies=[Depends(_require_key)])
 async def permission_wait(request_id: str):
     decision = await asyncio.to_thread(broker.wait, request_id, 600.0)
     if decision is None:
@@ -420,7 +545,7 @@ async def permission_wait(request_id: str):
     return decision
 
 
-@app.post("/permission/{request_id}/decide")
+@app.post("/permission/{request_id}/decide", dependencies=[Depends(_require_key)])
 async def permission_decide(request_id: str, body: _PermissionDecision):
     ok = broker.decide(
         request_id, body.behavior, body.scope, body.message, body.updated_input
@@ -561,20 +686,26 @@ def _stream_agent(
         agent_router.update_outcome(request.task_type, agent_name, success=True)
 
     if full_response:
+        from backend.security import scrub_secrets as _scrub
+        _episodic_content = f"User: {request.prompt}\nAssistant: {full_response[:500]}"
+        if request.project_id == "default":
+            _episodic_content = _scrub(_episodic_content)
         memory_client.store(
-            content=f"User: {request.prompt}\nAssistant: {full_response[:500]}",
+            content=_episodic_content,
             metadata={
                 "session_id": request.session_id,
                 "agent": agent_name,
                 "cwd": request.cwd,
+                "project_id": request.project_id,
             },
             tier="episodic",
         )
-        threading.Thread(
-            target=agent_router.learn_from_prompt,
-            args=(request.prompt, full_response, agent_name),
-            daemon=True,
-        ).start()
+        def _learn():
+            try:
+                agent_router.learn_from_prompt(request.prompt, full_response, agent_name, request.project_id, request.session_id)
+            except Exception as _e:
+                print(f"[learn_from_prompt] unhandled error in thread: {_e}")
+        threading.Thread(target=_learn, daemon=True).start()
 
     yield f"\n__TIMING__:{json.dumps({'agent': agent_name, 'agent_start': _fmt_ms((t_first_box[0] - t3) * 1000) if t_first_box[0] else 'n/a', 'agent_total': _fmt_ms((t4 - t3) * 1000)})}"
 
@@ -593,7 +724,15 @@ async def chat(request: ChatRequest):
         # ── Step 1: memory lookup ──────────────────────────────────────────
         yield _status("Checking context memory...")
         t0 = _time.perf_counter()
-        memory_hit = agent_router.check_memory(request.prompt, request.session_id)
+        _mem_host = "host.docker.internal" if os.environ.get("LEADAGENT_DOCKER_MODE") else "localhost"
+        if not _memory_http_ok(_mem_host, timeout=2.0):
+            yield _status("AgentMemory unavailable — proceeding with graph-only context")
+        memory_hit = agent_router.check_memory(
+            request.prompt,
+            request.session_id,
+            project_id=request.project_id,
+            memory_scope=request.memory_scope,
+        )
         t1 = _time.perf_counter()
         injected_context = ""
         if memory_hit:
@@ -743,6 +882,8 @@ async def debate(request: DebateRequest):
             rounds=request.rounds,
             cwd=request.cwd,
             agents=request.agents or None,
+            project_id=request.project_id,
+            force=request.force,
         )
 
     return StreamingResponse(generator(), media_type="text/plain")
@@ -752,69 +893,141 @@ async def debate(request: DebateRequest):
 
 
 @app.post("/memory/entities")
-async def add_entity(entity: Entity):
+async def add_entity(entity: Entity, request: Request):
+    if is_blocked_entity(entity.name):
+        raise HTTPException(status_code=400, detail=f"Entity name '{entity.name}' rejected by security blocklist.")
+    # X-LeadAgent-Promote is a UX guard against accidental global-pool writes — NOT a
+    # security boundary. Any caller with a valid X-LeadAgent-Key can trivially add this
+    # header. It prevents legitimate clients from accidentally polluting the default pool.
+    if entity.project_id == "default" and not request.headers.get("x-leadagent-promote"):
+        raise HTTPException(
+            status_code=403,
+            detail="Direct writes to project_id='default' require X-LeadAgent-Promote header. "
+                   "Use a project-scoped write and promote explicitly.",
+        )
     try:
-        db.add_entity(entity.name, entity.type, entity.description or "")
+        db.add_entity(entity.name, entity.type, entity.description or "", source_project_id=entity.project_id)
         return {"status": "success", "entity": entity.name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/memory/relationships")
-async def add_relationship(rel: Relationship):
+async def add_relationship(rel: Relationship, request: Request):
+    if rel.project_id == "default" and not request.headers.get("x-leadagent-promote"):
+        raise HTTPException(
+            status_code=403,
+            detail="Direct writes to project_id='default' require X-LeadAgent-Promote header.",
+        )
     try:
-        db.add_relationship(rel.source, rel.target, rel.type)
+        db.add_relationship(rel.source, rel.target, rel.type, project_id=rel.project_id)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/memory/graph")
-async def get_graph():
-    entities = [
-        {"name": row[0], "type": row[1], "description": row[2]}
-        for row in db.query_all("MATCH (e:Entity) RETURN e.name, e.type, e.description")
-    ]
-    relationships = [
-        {"source": row[0], "target": row[1], "type": row[2]}
-        for row in db.query_all(
-            "MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) RETURN a.name, b.name, r.type"
-        )
-    ]
+async def get_graph(project_id: str = None):
+    if project_id:
+        entities = [
+            {"name": row[0], "type": row[1], "description": row[2]}
+            for row in db.query_all(
+                "MATCH (e:Entity) WHERE e.project_id = $pid RETURN e.name, e.type, e.description",
+                {"pid": project_id},
+            )
+        ]
+        relationships = [
+            {"source": row[0], "target": row[1], "type": row[2]}
+            for row in db.query_all(
+                "MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) WHERE a.project_id = $pid RETURN a.name, b.name, r.type",
+                {"pid": project_id},
+            )
+        ]
+    else:
+        entities = [
+            {"name": row[0], "type": row[1], "description": row[2]}
+            for row in db.query_all("MATCH (e:Entity) RETURN e.name, e.type, e.description")
+        ]
+        relationships = [
+            {"source": row[0], "target": row[1], "type": row[2]}
+            for row in db.query_all(
+                "MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) RETURN a.name, b.name, r.type"
+            )
+        ]
     return {"entities": entities, "relationships": relationships}
 
 
 @app.get("/memory/graph/d3")
-async def get_graph_d3():
-    """Format graph for D3/vis.js (Phase 2)."""
-    entities = db.query_all("MATCH (e:Entity) RETURN e.name, e.type")
+async def get_graph_d3(project_id: str = "default"):
+    """Format graph for vis.js — combines KuzuDB entities/files with AgentMemory semantic nodes."""
+    entities = db.query_all(
+        "MATCH (e:Entity) WHERE e.project_id = $pid OR $pid = 'default' RETURN e.name, e.type, e.description, e.source_agent",
+        {"pid": project_id},
+    )
     files = db.query_all("MATCH (f:File) RETURN f.path, f.name")
 
+    node_ids: set[str] = set()
     nodes = []
-    # Add Entity nodes
-    for name, etype in entities:
-        nodes.append({"id": name, "label": name, "group": "entity", "type": etype})
 
-    # Add File nodes
-    for path, name in files:
-        nodes.append({"id": path, "label": name, "group": "file", "title": path})
+    for name, etype, desc, agent in entities:
+        if name in node_ids:
+            continue
+        node_ids.add(name)
+        nodes.append({
+            "id": name, "label": name, "group": etype or "entity",
+            "title": f"<b>{name}</b><br>type: {etype}<br>agent: {agent or '—'}<br>{desc or ''}",
+            "source": "kuzu",
+        })
+
+    for path, fname in files:
+        if path in node_ids:
+            continue
+        node_ids.add(path)
+        nodes.append({
+            "id": path, "label": fname, "group": "file",
+            "title": f"<b>{fname}</b><br>{path}", "source": "kuzu",
+        })
 
     edges = []
-    # RELATED_TO edges
-    rel_rows = db.query_all("MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) RETURN a.name, b.name, r.type")
+    rel_rows = db.query_all(
+        "MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity) RETURN a.name, b.name, r.type"
+    )
     for src, tgt, rtype in rel_rows:
-        edges.append({"from": src, "to": tgt, "label": rtype})
+        if src in node_ids and tgt in node_ids:
+            edges.append({"from": src, "to": tgt, "label": rtype or ""})
 
-    # FS edges
     fs_rows = db.query_all("MATCH (a)-[r:CONTAINS]->(b) RETURN a.path, b.path")
     for src, tgt in fs_rows:
-        if src and tgt:
-            edges.append({"from": src, "to": tgt, "dashes": True, "color": "gray"})
+        if src and tgt and src in node_ids and tgt in node_ids:
+            edges.append({"from": src, "to": tgt, "dashes": True})
+
+    # ── AgentMemory semantic nodes ────────────────────────────────────────────
+    try:
+        sem_results = memory_client.search("", limit=40, project_id=project_id if project_id != "default" else None)
+        for i, r in enumerate(sem_results or []):
+            content = r.get("content") or ""
+            meta = r.get("metadata") or {}
+            agent = meta.get("agent", "")
+            tier = meta.get("tier", "episodic")
+            snippet = content[:60].replace("\n", " ") + ("…" if len(content) > 60 else "")
+            nid = f"__sem_{i}"
+            node_ids.add(nid)
+            nodes.append({
+                "id": nid, "label": snippet, "group": f"sem_{tier}",
+                "title": f"<b>AgentMemory ({tier})</b><br>agent: {agent or '—'}<br>{content[:200]}",
+                "source": "agentmemory",
+            })
+            # Link to any entity node whose name appears in the content
+            for ename in list(node_ids):
+                if not ename.startswith("__") and ename.lower() in content.lower():
+                    edges.append({"from": nid, "to": ename, "dashes": True})
+    except Exception:
+        pass
 
     return {"nodes": nodes, "edges": edges}
 
 
-@app.post("/memory/forget")
+@app.post("/memory/forget", dependencies=[Depends(_require_key)])
 async def forget_memory(request: dict):
     session_id = request.get("session_id", "default")
     project_id = request.get("project_id", "default")
@@ -891,7 +1104,7 @@ class RuleEvaluateRequest(BaseModel):
     session_id: str = "default"
 
 
-@app.get("/rules")
+@app.get("/rules", dependencies=[Depends(_require_key)])
 async def list_rules():
     rows = db.list_rules()
     return [
@@ -903,7 +1116,7 @@ async def list_rules():
     ]
 
 
-@app.post("/rules")
+@app.post("/rules", dependencies=[Depends(_require_key)])
 async def create_rule(body: RuleCreate):
     if body.action not in ("allow", "deny", "ask"):
         raise HTTPException(status_code=400, detail="action must be allow, deny, or ask")
@@ -918,7 +1131,7 @@ async def create_rule(body: RuleCreate):
     return {"id": rule_id, "status": "created"}
 
 
-@app.delete("/rules/{rule_id}")
+@app.delete("/rules/{rule_id}", dependencies=[Depends(_require_key)])
 async def delete_rule(rule_id: str):
     ok = db.delete_rule(rule_id)
     if not ok:
@@ -926,7 +1139,7 @@ async def delete_rule(rule_id: str):
     return {"id": rule_id, "status": "deleted"}
 
 
-@app.post("/rules/evaluate")
+@app.post("/rules/evaluate", dependencies=[Depends(_require_key)])
 async def evaluate_rule(body: RuleEvaluateRequest):
     from backend.rules import evaluate
     action, reason = evaluate(body.tool_name, body.input, body.agent, body.session_id)

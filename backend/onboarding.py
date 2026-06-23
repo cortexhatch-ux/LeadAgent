@@ -1,4 +1,5 @@
 """Terminal-fallback onboarding (used when tkinter isn't available)."""
+from __future__ import annotations
 
 import os
 import shutil
@@ -132,7 +133,7 @@ class OnboardingManager:
             container = container_map.get(key)
 
             is_docker = False
-            if shutil.which("docker") and container:
+            if container and shutil.which("docker"):
                 try:
                     res = subprocess.run(
                         ["docker", "inspect", "-f", "{{.State.Running}}", container],
