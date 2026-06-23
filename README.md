@@ -4,13 +4,15 @@ Route any prompt to **Claude**, **Gemini**, **Codex**, or **Grok** from a single
 
 > **Latest Release: v0.7.0** — Interactive knowledge graph, dual-tier semantic memory, httpOnly cookie auth for the dashboard, and hardened debate engine.
 
+> ⚠️ **Upgrading from v0.6.x or lower versions? Fresh install recommended.** Docker container labels changed and the KuzuDB schema was updated. See [Upgrading to v0.7.0](#upgrading-to-v070-recommended-fresh-install) below.
+
 ## Visual Tour
 
 ### Agent Routing
 ![Agent Routing — enabled agents and task affinity scoring](docs/screenshots/agent_routing.png)
 
 ### Knowledge Graph
-![Knowledge Graph — real-time cross-project memory connections](docs/screenshots/knowledge_graph.png)
+![Knowledge Graph — real-time cross-project memory connections](docs/screenshots/knowledge_graph.png?v=0.7.0)
 
 ### MCP Tool Rules
 ![MCP Tool Rules — configuring block/allow/escalate rules per capability](docs/screenshots/mcp_tool_rules.png)
