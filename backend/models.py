@@ -7,6 +7,7 @@ class Entity(BaseModel):
     name: str
     type: str
     description: Optional[str] = None
+    project_id: str = "default"
     properties: Dict[str, Any] = {}
 
 
@@ -15,6 +16,7 @@ class Relationship(BaseModel):
     target: str
     type: str
     description: Optional[str] = None
+    project_id: str = "default"
     properties: Dict[str, Any] = {}
 
 

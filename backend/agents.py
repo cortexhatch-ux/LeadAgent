@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -58,7 +60,7 @@ def is_installed_anywhere(cli: str, agent_key: str | None = None) -> bool:
         import requests
         agent = OllamaAgent()
         try:
-            resp = requests.get(f"{agent.url}/api/tags", timeout=0.5)
+            resp = requests.get(f"{agent.url}/api/tags", timeout=1.0)
             if resp.status_code == 200:
                 return True
         except Exception:
@@ -129,7 +131,6 @@ def _allowed_cwd_roots() -> list[str]:
     """Directories an agent is permitted to run inside."""
     roots = [
         _PROJECT_ROOT,
-        os.path.expanduser("~"),
         tempfile.gettempdir(),
         "/app/leadagent-data",
     ]
@@ -209,8 +210,8 @@ _SUPPRESS_PREFIXES = (
 
 class CLIAgent:
     def __init__(self, command: str, agent_key: str | None = None):
-        self.command = command
         self.agent_key = agent_key or command
+        self.command = _CLI_MAP.get(command, command)
 
     def _build_popen_args(self, prompt: str, cwd: str, mode: str, gemini_model: str | None = None) -> tuple[list[str], str | None, bool]:
         """Return (args, stdin_data, use_stdin)."""
@@ -220,7 +221,7 @@ class CLIAgent:
         if self.command == "agy":
             flags = []
             if mode == "execute":
-                flags.append("--dangerously-skip-permissions")
+                flags += ["--permission-mode", "auto"]
             if gemini_model:
                 flags += ["--model", gemini_model]
             if not use_stdin:
@@ -512,10 +513,10 @@ class CLIAgent:
                     
                     if etype == "error":
                         msg = event.get("message") or "Unknown error"
-                        if "login" in msg.lower() or "token" in msg.lower() or "session" in msg.lower():
-                            yield f"\n[Codex Error]: Authentication failed. Please run 'codex login' in your terminal.\n"
-                        else:
-                            yield f"\n[Codex Error]: {msg}\n"
+                        low_msg = msg.lower()
+                        if "usage limit" in low_msg or "quota" in low_msg:
+                            raise Exception("AGENT_TRANSIENT_ERROR")
+                        yield f"\n[Codex Error]: {msg}\n"
 
                     # 2. Robust text extraction
                     # Only skip high-level boilerplate events that we know don't contain content
@@ -547,6 +548,8 @@ class CLIAgent:
         # Use python3 as the command in containers, sys.executable locally
         python_cmd = "python3" if os.environ.get("LEADAGENT_DOCKER_MODE") else sys.executable
 
+        from backend.security import get_api_key as _get_api_key
+        _api_key = _get_api_key() or ""
         mcp_cfg = {
             "mcpServers": {
                 "leadagent_perm": {
@@ -556,6 +559,7 @@ class CLIAgent:
                         "LEADAGENT_SESSION_ID": session_id,
                         "LEADAGENT_BACKEND_URL": backend_url,
                         "LEADAGENT_AGENT_NAME": "claude",
+                        "LEADAGENT_API_KEY": _api_key,
                         "PYTHONPATH": "/app/leadagent-data" if os.environ.get("LEADAGENT_DOCKER_MODE") else _PROJECT_ROOT,
                     },
                 },
@@ -565,6 +569,7 @@ class CLIAgent:
                     "env": {
                         "LEADAGENT_SESSION_ID": session_id,
                         "LEADAGENT_BACKEND_URL": backend_url,
+                        "LEADAGENT_API_KEY": _api_key,
                         "PYTHONPATH": "/app/leadagent-data" if os.environ.get("LEADAGENT_DOCKER_MODE") else _PROJECT_ROOT,
                     },
                 },
@@ -891,14 +896,60 @@ class CLIAgent:
             raise Exception(detail)
 
 
-import requests
-
 class OllamaAgent:
     """Agent that talks to a local Ollama server."""
     def __init__(self, model: str = ""):
-        self.model = model or os.environ.get("LEADAGENT_OLLAMA_MODEL", "llama3")
+        self.model = model or os.environ.get("LEADAGENT_OLLAMA_MODEL", "llama3.2:3b")
         default_host = "http://ollama:11434" if os.environ.get("LEADAGENT_DOCKER_MODE") else "http://localhost:11434"
         self.url = os.environ.get("OLLAMA_HOST", default_host)
+
+    def is_model_ready(self) -> bool:
+        """Return True if the configured model is already present in /api/tags."""
+        import requests as _req
+        try:
+            resp = _req.get(f"{self.url}/api/tags", timeout=1.0)
+            resp.raise_for_status()
+            tags = resp.json()
+            available = [m.get("name", "") for m in tags.get("models", [])]
+            model_base = self.model.split(":")[0]
+            return any(m == self.model or m.startswith(model_base + ":") for m in available)
+        except Exception:
+            return False
+
+    def ensure_model(self) -> bool:
+        """Pull the configured model if not already available. Returns True on success."""
+        import requests as _req
+        try:
+            resp = _req.get(f"{self.url}/api/tags", timeout=5)
+            resp.raise_for_status()
+            tags = resp.json()
+            available = [m.get("name", "") for m in tags.get("models", [])]
+            model_base = self.model.split(":")[0]
+            if any(m == self.model or m.startswith(model_base + ":") for m in available):
+                return True
+        except Exception:
+            return False  # Server not reachable
+        try:
+            pull = _req.post(
+                f"{self.url}/api/pull",
+                json={"name": self.model, "stream": True},
+                stream=True,
+                timeout=(10, 600),
+            )
+            pull.raise_for_status()
+            for line in pull.iter_lines():
+                if line:
+                    import json as _json
+                    data = _json.loads(line)
+                    if data.get("error"):
+                        print(f"[OllamaAgent] pull error for {self.model}: {data['error']}")
+                        return False
+                    if data.get("status") == "success":
+                        return True
+            return False
+        except Exception as e:
+            print(f"[OllamaAgent] ensure_model failed for {self.model}: {e}")
+            return False
 
     def execute_stream(
         self,
@@ -908,6 +959,7 @@ class OllamaAgent:
         simple: bool = False,
         mode: str = "plan",
     ) -> Generator[str, None, None]:
+        import requests
         try:
             response = requests.post(
                 f"{self.url}/api/generate",
@@ -928,7 +980,39 @@ class OllamaAgent:
                         break
         except requests.exceptions.HTTPError as he:
             if he.response.status_code == 404:
-                yield f"\n[Ollama Error]: Model '{self.model}' not found. Run 'ollama pull {self.model}' to install it.\n"
+                yield f"\n[Ollama]: Model '{self.model}' not found — pulling now, please wait...\n"
+                try:
+                    pull_resp = requests.post(
+                        f"{self.url}/api/pull",
+                        json={"name": self.model, "stream": True},
+                        stream=True,
+                        timeout=(10, 600),
+                    )
+                    pull_resp.raise_for_status()
+                    for line in pull_resp.iter_lines():
+                        if line:
+                            data = json.loads(line)
+                            status = data.get("status", "")
+                            if status:
+                                yield f"  {status}\n"
+                            if data.get("status") == "success":
+                                break
+                    # Retry the original request
+                    response = requests.post(
+                        f"{self.url}/api/generate",
+                        json={"model": self.model, "prompt": prompt, "stream": True},
+                        stream=True,
+                        timeout=(10, 120),
+                    )
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if line:
+                            data = json.loads(line)
+                            yield data.get("response", "")
+                            if data.get("done"):
+                                break
+                except Exception as pull_err:
+                    yield f"\n[Ollama Error]: Auto-pull failed: {pull_err}\n"
             else:
                 yield f"\n[Ollama Error]: HTTP {he.response.status_code} - {he.response.text}\n"
         except Exception as e:

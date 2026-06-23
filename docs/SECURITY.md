@@ -132,12 +132,33 @@ races with the janitor/learning threads.
 
 ---
 
+### 9. Dashboard API key exposed in query params / sessionStorage — **Medium → Fixed**
+
+The dashboard previously required the API key to be passed as a URL query parameter (`?key=...`) or stored in `sessionStorage` — both accessible from JS and visible in browser history.
+
+**Fix:** The dashboard now uses an **httpOnly session cookie** (`la_session`).
+
+Flow:
+1. `GET /dashboard` redirects unauthenticated users to `GET /dashboard/login`.
+2. `POST /dashboard/login` accepts the API key via a form field (not URL), validates it with a constant-time compare, and sets an `httpOnly; SameSite=Strict` cookie containing a 32-byte random session token.
+3. `GuardMiddleware` accepts the cookie as equivalent to the `X-LeadAgent-Key` header. JS code in the dashboard never sees the key or the token.
+4. `/dashboard/login` and `/dashboard/logout` are listed in `_AUTH_SELF_PATHS` so the guard does not block the login page itself.
+
+Cookie attributes:
+- `httponly=True` — JS `document.cookie` cannot read it.
+- `samesite="strict"` — browser will not attach it to cross-site requests, blocking CSRF.
+- `max_age=28800` (8 hours) — session expires automatically.
+
+### 10. `BaseHTTPMiddleware` incompatibility with redirect responses — **Low → Fixed**
+
+Starlette 1.3.1 / FastAPI 0.138 raised `KeyError: 'background'` when `BaseHTTPMiddleware` processed redirect responses — because redirect scopes lack a `background` key that the middleware assumed.
+
+**Fix:** `GuardMiddleware` was rewritten as a **pure ASGI class** (`__call__(scope, receive, send)`) that bypasses `BaseHTTPMiddleware` entirely. It constructs `Request` from the raw ASGI scope, performs all checks (host, origin, key/cookie, rate limit) and either short-circuits with a JSON response or delegates to the inner app. This is forward-compatible with future Starlette versions.
+
+---
+
 ## What is intentionally *not* changed
 
-- **A full auth token on every endpoint.** The Host + Origin guard already
-  closes the LAN and browser vectors for a single-user desktop without breaking
-  the local CLI and MCP callers. A shared-secret token is the right next step if
-  LeadAgent is ever exposed beyond localhost.
 - **Routing Codex/Gemini through the MCP permission broker** (as Claude is).
   This is a larger change; the sandbox default in #3 is the pragmatic interim.
 
@@ -149,6 +170,7 @@ races with the janitor/learning threads.
 | `LEADAGENT_ALLOWED_HOSTS` | extra allowed `Host`/`Origin` names (comma list) | empty |
 | `LEADAGENT_ALLOWED_CWD` | extra allowed agent working-dir roots (`:`-separated) | empty |
 | `LEADAGENT_ALLOW_UNSANDBOXED` | restore Codex full host/network access | unset (sandboxed) |
+| `LEADAGENT_DOCKER_MODE` | use `host.docker.internal` for AgentMemory; expand host allow-list | unset |
 
 ## Verification
 
@@ -162,3 +184,7 @@ All changes are covered by `pytest`:
   dirs rejected.
 
 Full suite: **332 passed** (316 pre-existing + 16 new).
+
+Tests added in v0.7.0:
+- `tests/test_api.py::TestAuditSession` — 5 tests for `/v1/audit/session` shape normalisation (standard, observation narrative, title fallback, unknown shape, empty history).
+- `tests/test_router.py::TestCheckMemoryContentFallback` — 5 tests for `check_memory` content-field normalisation across AgentMemory response shapes.

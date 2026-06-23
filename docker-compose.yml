@@ -1,6 +1,8 @@
 networks:
   leadagent-net:
     driver: bridge
+    labels:
+      - "com.leadagent.tag=true"
 
 services:
 
@@ -88,7 +90,9 @@ services:
       - leadagent-net
     volumes:
       - .:/app/leadagent-data
-      - ${HOME}/.grok/auth.json:/home/node/.grok/auth.json:ro
+      - ${HOME}/.grok:/home/node/.grok:rw
+      # Shadow the host macOS bin dir so it doesn't override the Linux npm-installed grok
+      - grok-bin-shadow:/home/node/.grok/bin
       # Mirror host projects path
       - ${LEADAGENT_WORKSPACE:-/tmp}:${LEADAGENT_WORKSPACE:-/tmp}
     restart: unless-stopped
@@ -186,7 +190,9 @@ services:
       - LEADAGENT_TAG=true
       - LEADAGENT_DOCKER_MODE=1
       - LEADAGENT_WORKSPACE=${LEADAGENT_WORKSPACE}
-    restart: unless-stopped
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
+    restart: "no"
     depends_on:
       - backend
 
@@ -200,7 +206,7 @@ services:
     networks:
       - leadagent-net
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ./leadagent-data/ollama:/root/.ollama
     # Model loads are the biggest single allocation in the stack — it was an
@@ -208,5 +214,7 @@ services:
     mem_limit: 3g
     restart: unless-stopped
 
-# NOTE — agentmemory is NOT included here.
-# Start it natively before docker compose up:  agentmemory serve --port 3111
+volumes:
+  grok-bin-shadow:
+    labels:
+      - "com.leadagent.tag=true"

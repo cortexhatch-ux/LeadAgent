@@ -83,30 +83,6 @@ class TestSetResetFromCli:
         assert qm.state["claude"].limit_type == "weekly"
 
 
-class TestSyncRealUsage:
-    def test_sets_daily_pct(self, qm):
-        qm.sync_real_usage("claude", daily_pct=55.0)
-        assert qm.state["claude"].real_daily_pct == 55.0
-
-    def test_sets_weekly_pct(self, qm):
-        qm.sync_real_usage("claude", weekly_pct=80.0)
-        assert qm.state["claude"].real_weekly_pct == 80.0
-
-    def test_100_daily_pct_marks_exhausted(self, qm):
-        qm.sync_real_usage("claude", daily_pct=100.0)
-        assert qm.state["claude"].exhausted is True
-        assert qm.state["claude"].limit_type == "daily"
-
-    def test_100_weekly_pct_marks_exhausted(self, qm):
-        qm.sync_real_usage("claude", weekly_pct=100.0)
-        assert qm.state["claude"].exhausted is True
-        assert qm.state["claude"].limit_type == "weekly"
-
-    def test_below_100_does_not_exhaust(self, qm):
-        qm.sync_real_usage("claude", daily_pct=99.9)
-        assert not qm.state["claude"].exhausted
-
-
 class TestGetAvailableAgents:
     def test_all_available_when_fresh(self, qm):
         available = qm.get_available_agents()

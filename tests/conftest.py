@@ -81,3 +81,20 @@ def _mock_context_cache(monkeypatch):
                 except Exception:
                     pass
     return mock_cc
+
+
+@pytest.fixture(autouse=True)
+def _mock_ollama(monkeypatch):
+    """Prevent any test from hitting the real Ollama server at localhost:11434."""
+    mock_agent = MagicMock()
+    mock_agent.is_model_ready.return_value = False
+    mock_agent.execute_stream.return_value = iter([])
+    monkeypatch.setattr("backend.agents.OllamaAgent", lambda *a, **kw: mock_agent, raising=False)
+    for mod_name in list(sys.modules):
+        if mod_name.startswith("backend."):
+            mod = sys.modules[mod_name]
+            if hasattr(mod, "OllamaAgent"):
+                try:
+                    monkeypatch.setattr(mod, "OllamaAgent", lambda *a, **kw: mock_agent, raising=False)
+                except Exception:
+                    pass

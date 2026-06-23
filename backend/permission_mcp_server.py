@@ -15,6 +15,8 @@ port = 8000 if os.environ.get("LEADAGENT_DOCKER_MODE") else 8001
 BACKEND_URL = os.environ.get("LEADAGENT_BACKEND_URL", f"http://localhost:{port}")
 SESSION_ID = os.environ.get("LEADAGENT_SESSION_ID", "default")
 AGENT_NAME = os.environ.get("LEADAGENT_AGENT_NAME", "claude")
+_API_KEY = os.environ.get("LEADAGENT_API_KEY", "")
+_AUTH_HEADERS = {"X-LeadAgent-Key": _API_KEY} if _API_KEY else {}
 
 # Rules are evaluated via the backend HTTP API so this server stays stateless.
 # The backend holds the DB connection and the rules engine.
@@ -108,6 +110,7 @@ def _ask_permission(id_: object, args: dict) -> None:
         rule_resp = requests.post(
             _RULES_URL,
             json={"tool_name": tool_name, "input": input_, "agent": AGENT_NAME, "session_id": SESSION_ID},
+            headers=_AUTH_HEADERS,
             timeout=5,
         )
         if rule_resp.ok:
@@ -145,6 +148,7 @@ def _ask_permission(id_: object, args: dict) -> None:
                 "tool_name": tool_name,
                 "input": input_,
             },
+            headers=_AUTH_HEADERS,
             timeout=5,
         )
         resp.raise_for_status()
@@ -163,6 +167,7 @@ def _ask_permission(id_: object, args: dict) -> None:
         # Block until the user decides (up to 10 minutes)
         wait_resp = requests.get(
             f"{BACKEND_URL}/permission/{req_id}/wait",
+            headers=_AUTH_HEADERS,
             timeout=610,
         )
         wait_resp.raise_for_status()

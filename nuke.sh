@@ -19,7 +19,7 @@ ok()  { printf "  ${C_G}✓${C_R} %s\n" "$*"; }
 # Confirmation
 if [[ "$*" != *"--force"* ]]; then
     printf "${C_RED}${C_B}⚠️  WARNING: This will completely destroy your LeadAgent environment!${C_R}\n"
-    printf "   - All local memory (KuzuDB) will be deleted.\n"
+    printf "   - All local memory (KuzuDB + agentmemory) will be deleted.\n"
     printf "   - All background processes will be killed.\n"
     printf "   - The Python virtual environment will be removed.\n"
     printf "   - The CLI binary will be deleted.\n\n"
@@ -34,13 +34,56 @@ fi
 # ─── 1. Stop Processes ────────────────────────────────────────────────────────
 say "Stopping all LeadAgent processes..."
 
-# Docker
-if command -v docker >/dev/null 2>&1 && [ -f "docker-compose.yml" ]; then
-    if docker compose ps >/dev/null 2>&1; then
+# Docker — all stacks
+if command -v docker >/dev/null 2>&1; then
+    # ── LeadAgent compose stack ──────────────────────────────────────────────
+    if [ -f "docker-compose.yml" ] && docker compose ps >/dev/null 2>&1; then
         docker compose down -v --remove-orphans >/dev/null 2>&1 || true
-        ok "Docker containers and volumes removed"
+        ok "LeadAgent Docker stack removed"
     fi
+
+    # ── agentmemory compose stack ────────────────────────────────────────────
+    AGENTMEMORY_COMPOSE_DIR=""
+    for candidate in \
+        "$(npm root -g 2>/dev/null)/@agentmemory/agentmemory" \
+        "$HOME/.nvm/versions/node/$(node --version 2>/dev/null)/lib/node_modules/@agentmemory/agentmemory" \
+        "/usr/local/lib/node_modules/@agentmemory/agentmemory"; do
+        if [ -f "$candidate/docker-compose.yml" ]; then
+            AGENTMEMORY_COMPOSE_DIR="$candidate"
+            break
+        fi
+    done
+    AGENTMEMORY_OVERRIDE="$HOME/.agentmemory/docker-compose.override.yml"
+    AGENTMEMORY_COMPOSE_ARGS="-f $AGENTMEMORY_COMPOSE_DIR/docker-compose.yml"
+    [ -f "$AGENTMEMORY_OVERRIDE" ] && AGENTMEMORY_COMPOSE_ARGS="$AGENTMEMORY_COMPOSE_ARGS -f $AGENTMEMORY_OVERRIDE"
+    # Kill native iii process (holds ports 3111/3112, not Docker-tagged)
+    pgrep -x iii 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    # Also kill any agentmemory node process running natively
+    pgrep -f "agentmemory" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+
+    if [ -n "$AGENTMEMORY_COMPOSE_DIR" ]; then
+        docker compose $AGENTMEMORY_COMPOSE_ARGS down -v --remove-orphans >/dev/null 2>&1 || true
+        ok "agentmemory Docker stack removed"
+    fi
+
+    # ── Label-based safety net ───────────────────────────────────────────────
+    # Catches anything tagged com.leadagent.tag=true that compose down missed
+    # (e.g. containers started outside compose, or from a different working dir).
+    TAGGED=$(docker ps -aq --filter "label=com.leadagent.tag=true" 2>/dev/null)
+    if [ -n "$TAGGED" ]; then
+        echo "$TAGGED" | xargs docker rm -f >/dev/null 2>&1 || true
+        ok "Removed residual tagged containers"
+    fi
+
+    # Volumes and networks tagged com.leadagent.tag=true
+    docker volume ls --format "{{.Name}}" --filter "label=com.leadagent.tag=true" 2>/dev/null \
+        | xargs -r docker volume rm >/dev/null 2>&1 || true
+    docker network ls --format "{{.Name}}" --filter "label=com.leadagent.tag=true" 2>/dev/null \
+        | xargs -r docker network rm >/dev/null 2>&1 || true
 fi
+
+# Kill CLI processes
+pgrep -f "cli/leadagent" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
 
 # Native (Surgical Kill)
 PIDS=$(pgrep -f "LEADAGENT_TAG=true" || true)

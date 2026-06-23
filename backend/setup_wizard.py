@@ -1032,9 +1032,30 @@ class SetupWizard:
             self.status_label.config(text=f"Failed to open terminal: {e}", fg=RED)
 
 
+def _tk_version_ok() -> bool:
+    """Return False if the system Tk is too old (macOS system Tk 8.5) to render unicode."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        ver = root.tk.call("info", "patchlevel")
+        root.destroy()
+        major, minor = int(str(ver).split(".")[0]), int(str(ver).split(".")[1])
+        return (major, minor) >= (8, 6)
+    except Exception:
+        return False
+
+
 def main():
     if not _HAS_TK:
         print("⚠️  tkinter not available — using terminal setup instead.")
+        _tui_wizard()
+        return
+    if not _tk_version_ok():
+        print(
+            "⚠️  System Tk is too old to render the GUI (macOS system Tk 8.5 detected)."
+        )
+        print("   Fix: brew install python-tk@3.11  (then reopen a fresh terminal)")
+        print("   Falling back to terminal setup...\n")
         _tui_wizard()
         return
     try:

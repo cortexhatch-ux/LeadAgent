@@ -144,6 +144,7 @@ def _container_running(agent_key: str) -> bool:
         "gemini": "leadagent-gemini",
         "codex": "leadagent-codex",
         "grok": "leadagent-grok",
+        "ollama": "leadagent-ollama",
     }
     container = container_map.get(agent_key)
     if not container or not shutil.which("docker"):
@@ -164,15 +165,17 @@ def is_installed(agent_key: str) -> bool:
     if agent_key == "ollama":
         # For Ollama, we prioritize the REST API check since it's a service.
         # Check both local and docker hosts.
-        from backend.agents import OllamaAgent
-        import requests
-        agent = OllamaAgent()
         try:
-            # Quick probe to the /api/tags or version endpoint
-            resp = requests.get(f"{agent.url}/api/tags", timeout=0.5)
-            if resp.status_code == 200:
-                return True
-        except Exception:
+            from backend.agents import OllamaAgent
+            import requests
+            agent = OllamaAgent()
+            try:
+                resp = requests.get(f"{agent.url}/api/tags", timeout=0.5)
+                if resp.status_code == 200:
+                    return True
+            except Exception:
+                pass
+        except ImportError:
             pass
 
     if os.environ.get("LEADAGENT_DOCKER_MODE"):
@@ -203,13 +206,14 @@ def is_authenticated(agent_key: str) -> Optional[bool]:
     if not is_installed(agent_key):
         return False
 
-    # Build command: use docker exec if in Docker mode and container is up
-    if os.environ.get("LEADAGENT_DOCKER_MODE") and _container_running(agent_key):
+    # Build command: use docker exec if container is running (auto-detected)
+    if _container_running(agent_key):
         container_map = {
             "claude": "leadagent-claude",
             "gemini": "leadagent-gemini",
             "codex": "leadagent-codex",
             "grok": "leadagent-grok",
+            "ollama": "leadagent-ollama",
         }
         cmd = ["docker", "exec", "-i", container_map[agent_key]] + spec.auth_check
     else:
@@ -218,6 +222,9 @@ def is_authenticated(agent_key: str) -> Optional[bool]:
 
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        # Ollama has no auth concept — reachable = good
+        if agent_key == "ollama":
+            return out.returncode == 0
         blob = (out.stdout + out.stderr).lower()
         return any(tok in blob for tok in _AUTH_OK_TOKENS)
     except Exception as e:

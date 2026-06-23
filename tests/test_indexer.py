@@ -38,7 +38,7 @@ def test_extract_entities_via_ollama_success():
         out = indexer.extract_entities_via_ollama("foo.py", "print('hi')")
         assert out == payload
         body = p.call_args.kwargs["json"]
-        assert body["model"] == "llama3"
+        assert body["model"] == "llama3.2:3b"
         assert body["stream"] is False
         assert body["format"] == "json"
         assert "foo.py" in body["prompt"]
@@ -94,9 +94,9 @@ def test_process_file_success(tmp_path, monkeypatch):
     assert ok is True
     fake_db.add_file.assert_called_once_with(str(f), "hello.py", ".py", "proj1")
     assert fake_db.add_entity.call_count == 2
-    fake_db.add_entity.assert_any_call("hi", "Function", "greets", project_id="proj1")
-    fake_db.add_entity.assert_any_call("X", "Class", "", project_id="proj1")
-    fake_db.add_relationship.assert_called_once_with("hi", "X", "USES")
+    fake_db.add_entity.assert_any_call("hi", "Function", "greets", source_project_id="proj1", auto_extracted=True, source_agent="indexer")
+    fake_db.add_entity.assert_any_call("X", "Class", "", source_project_id="proj1", auto_extracted=True, source_agent="indexer")
+    fake_db.add_relationship.assert_called_once_with("hi", "X", "USES", project_id="proj1")
 
 
 def test_process_file_missing_file_returns_false(tmp_path, monkeypatch, capsys):

@@ -15,6 +15,11 @@ from backend.agents import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _mock_installed(monkeypatch):
+    monkeypatch.setattr("backend.agents.is_installed_anywhere", lambda *a, **kw: True)
+
+
 # ── _safe_cwd ─────────────────────────────────────────────────────────────────
 
 class TestSafeCwd:
@@ -25,9 +30,10 @@ class TestSafeCwd:
         sub = os.path.join(_PROJECT_ROOT, "backend")
         assert _safe_cwd(sub) == os.path.realpath(sub)
 
-    def test_home_allowed(self):
+    def test_home_rejected(self):
+        # $HOME is no longer an allowed root (issue #6 hardening)
         home = os.path.expanduser("~")
-        assert _safe_cwd(home) == os.path.realpath(home)
+        assert _safe_cwd(home) is None
 
     def test_system_dir_rejected(self):
         # /etc exists but is outside every allowed root
@@ -64,7 +70,7 @@ class TestAgentFactory:
 
     def test_returns_cli_agent_for_gemini(self):
         agent = agent_factory.get_agent("gemini")
-        assert agent.command == "gemini"
+        assert agent.command == "agy"
 
     def test_returns_cli_agent_for_codex(self):
         agent = agent_factory.get_agent("codex")
@@ -371,3 +377,51 @@ class TestExecuteClaudeStream:
                 list(agent.execute_stream("hello", session_id="s1"))
 
         assert "/tmp/cleanup_exc.json" in deleted
+
+    # Issue #2: execute mode must produce --permission-mode acceptEdits for Claude,
+    # never --dangerously-skip-permissions or any variant of it.
+    def test_execute_mode_uses_accept_edits_not_dangerous_flag(self):
+        agent = CLIAgent("claude")
+        proc = self._fake_claude_process([])
+        captured_args = []
+
+        with (
+            patch("subprocess.Popen", side_effect=lambda args, **kw: (
+                captured_args.extend(args), proc)[1]),
+            patch("tempfile.NamedTemporaryFile") as mock_tmp,
+            patch("os.unlink"),
+        ):
+            mock_tmp.return_value.__enter__.return_value.name = "/tmp/mode_test.json"
+            mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
+            list(agent.execute_stream("go ahead", session_id="s1", mode="execute"))
+
+        args_str = " ".join(str(a) for a in captured_args)
+        assert "acceptEdits" in args_str, (
+            "execute mode must pass --permission-mode acceptEdits to claude"
+        )
+        assert "dangerously" not in args_str.lower(), (
+            "claude must never receive a dangerously-skip-permissions flag"
+        )
+
+    def test_plan_mode_uses_default_permission_mode(self):
+        agent = CLIAgent("claude")
+        proc = self._fake_claude_process([])
+        captured_args = []
+
+        with (
+            patch("subprocess.Popen", side_effect=lambda args, **kw: (
+                captured_args.extend(args), proc)[1]),
+            patch("tempfile.NamedTemporaryFile") as mock_tmp,
+            patch("os.unlink"),
+        ):
+            mock_tmp.return_value.__enter__.return_value.name = "/tmp/mode_plan.json"
+            mock_tmp.return_value.__exit__ = MagicMock(return_value=False)
+            list(agent.execute_stream("explain this", session_id="s1", mode="plan"))
+
+        args_str = " ".join(str(a) for a in captured_args)
+        assert "acceptEdits" not in args_str, (
+            "plan mode must not pass acceptEdits"
+        )
+        assert "dangerously" not in args_str.lower(), (
+            "plan mode must never receive a dangerously-skip-permissions flag"
+        )

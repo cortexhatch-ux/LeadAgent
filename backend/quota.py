@@ -20,8 +20,6 @@ class AgentQuota(BaseModel):
         None  # Unix ts of expected reset (may be exact from CLI output)
     )
     limit_type: Optional[str] = None  # "daily" or "weekly"
-    real_daily_pct: Optional[float] = None
-    real_weekly_pct: Optional[float] = None
 
 
 class QuotaManager:
@@ -36,18 +34,10 @@ class QuotaManager:
             result = {}
             for agent in RESET_INTERVALS:
                 entry = raw.get(agent, {})
-                # Migrate legacy format (had daily_tokens, weekly_tokens, etc.)
-                if "daily_tokens" in entry or "weekly_tokens" in entry:
-                    result[agent] = AgentQuota(
-                        exhausted=entry.get("exhausted", False),
-                        real_daily_pct=entry.get("real_daily_pct"),
-                        real_weekly_pct=entry.get("real_weekly_pct"),
-                    )
-                else:
-                    known = {
-                        k: v for k, v in entry.items() if k in AgentQuota.model_fields
-                    }
-                    result[agent] = AgentQuota(**known)
+                known = {
+                    k: v for k, v in entry.items() if k in AgentQuota.model_fields
+                }
+                result[agent] = AgentQuota(**known)
             return result
         return {agent: AgentQuota() for agent in RESET_INTERVALS}
 
@@ -120,67 +110,11 @@ class QuotaManager:
         state.limit_type = limit_type
         self._save_state()
 
-    def sync_real_usage(
-        self,
-        agent: str,
-        daily_pct: Optional[float] = None,
-        weekly_pct: Optional[float] = None,
-    ) -> list[str]:
-        alerts = []
-        if agent not in self.state:
-            return alerts
-        state = self.state[agent]
-
-        # Check thresholds (80% cliff as per debate consensus)
-        old_daily = state.real_daily_pct or 0
-        old_weekly = state.real_weekly_pct or 0
-
-        is_currently_exhausted = False
-        if daily_pct is not None:
-            state.real_daily_pct = daily_pct
-            if daily_pct >= 80 and old_daily < 80:
-                alerts.append(
-                    f"⚠️  {agent} daily quota reached {daily_pct:.0f}% (80% threshold)"
-                )
-            if daily_pct >= 100:
-                is_currently_exhausted = True
-
-        if weekly_pct is not None:
-            state.real_weekly_pct = weekly_pct
-            if weekly_pct >= 80 and old_weekly < 80:
-                alerts.append(
-                    f"⚠️  {agent} weekly quota reached {weekly_pct:.0f}% (80% threshold)"
-                )
-            if weekly_pct >= 100:
-                is_currently_exhausted = True
-
-        # If we are currently exhausted but the real usage is low, clear it
-        if state.exhausted and not is_currently_exhausted:
-            if daily_pct is not None or weekly_pct is not None:
-                # Only clear if we actually got a fresh reading
-                state.exhausted = False
-                state.exhausted_at = None
-                state.reset_at = None
-                state.limit_type = None
-                print(
-                    f"[QuotaManager] {agent} exhaustion cleared via real usage sync (Daily: {daily_pct}%, Weekly: {weekly_pct}%)"
-                )
-        elif is_currently_exhausted and not state.exhausted:
-            self.set_exhausted(
-                agent, True, "daily" if (daily_pct or 0) >= 100 else "weekly"
-            )
-
-        self._save_state()
-        return alerts
-
     # ── read methods ──────────────────────────────────────────────────────────
 
     def get_usage_percentage(self, agent: str) -> Optional[float]:
-        state = self.state.get(agent)
-        if not state:
-            return None
-        # Use daily as primary indicator for solo dev flow
-        return state.real_daily_pct
+        # Live usage scraping removed
+        return None
 
     def get_available_agents(self) -> list:
         self._auto_clear_resets()

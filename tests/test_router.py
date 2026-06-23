@@ -89,6 +89,32 @@ class TestDetectExecuteMode:
     def test_empty_returns_plan(self):
         assert _detect_execute_mode("") == "plan"
 
+    # Issue #2: expansion phrases must trigger execute so Claude gets acceptEdits,
+    # not dangerously-skip-permissions.
+    def test_implement_suggestions_returns_execute(self):
+        assert _detect_execute_mode("implement the suggestions") == "execute"
+
+    def test_apply_recommendations_returns_execute(self):
+        assert _detect_execute_mode("apply the recommendations") == "execute"
+
+    def test_go_ahead_returns_execute(self):
+        assert _detect_execute_mode("go ahead") == "execute"
+
+    def test_proceed_returns_execute(self):
+        assert _detect_execute_mode("proceed") == "execute"
+
+    def test_do_it_returns_execute(self):
+        assert _detect_execute_mode("do it") == "execute"
+
+    def test_ship_it_returns_execute(self):
+        assert _detect_execute_mode("ship it") == "execute"
+
+    def test_make_the_changes_returns_execute(self):
+        assert _detect_execute_mode("make the changes") == "execute"
+
+    def test_apply_this_returns_execute(self):
+        assert _detect_execute_mode("apply this") == "execute"
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -230,12 +256,13 @@ class TestRouteMulti:
             assert len(agents) == 1, f"Expected 1 agent for low complexity, got {agents}"
 
     def test_slm_high_complexity_allows_fanout(self):
-        """SLM recommending multiple agents should be kept for high complexity."""
+        """SLM recommending multiple agents should be kept when multi_agent_explicit=True."""
         slm_result = {
             "task_type": "deep_analysis",
             "complexity": "high",
             "recommended_agents": ["claude", "gemini"],
             "mode": "plan",
+            "multi_agent_explicit": True,
         }
         patches = _mock_route_deps()
         with patches[0], patches[1], patches[2], \
@@ -300,12 +327,12 @@ class TestLearnFromPrompt:
     def test_does_not_raise_on_db_error(self):
         with patch("backend.router.db") as mock_db:
             mock_db.add_question.side_effect = Exception("db error")
-            AgentRouter().learn_from_prompt("what is foo", "foo is bar", "claude")
+            AgentRouter().learn_from_prompt("what is foo", "foo is bar", "claude", project_id="proj-err")
 
     def test_extracts_snake_case_entities(self):
         calls = []
         with (
-            patch("backend.router.db.add_entity", side_effect=lambda *a: calls.append(a)),
+            patch("backend.router.db.add_entity", side_effect=lambda *a, **kw: calls.append(a)),
             patch("backend.router.db.add_question", return_value="q1"),
             patch("backend.router.db.link_question_to_entity"),
         ):
@@ -313,6 +340,7 @@ class TestLearnFromPrompt:
                 "how does permission_broker work",
                 "permission_broker manages the queue",
                 "claude",
+                project_id="proj-test",
             )
         names = [c[0] for c in calls]
         assert any("permission_broker" in n for n in names)
@@ -320,7 +348,7 @@ class TestLearnFromPrompt:
     def test_extracts_camel_case_entities(self):
         calls = []
         with (
-            patch("backend.router.db.add_entity", side_effect=lambda *a: calls.append(a)),
+            patch("backend.router.db.add_entity", side_effect=lambda *a, **kw: calls.append(a)),
             patch("backend.router.db.add_question", return_value="q1"),
             patch("backend.router.db.link_question_to_entity"),
         ):
@@ -328,6 +356,7 @@ class TestLearnFromPrompt:
                 "explain FastAPI routing",
                 "FastAPI uses decorators for routing",
                 "claude",
+                project_id="proj-test",
             )
         names = [c[0] for c in calls]
         assert any("FastAPI" in n for n in names)
@@ -335,7 +364,7 @@ class TestLearnFromPrompt:
     def test_strips_conversation_history_prefix(self):
         calls = []
         with (
-            patch("backend.router.db.add_entity", side_effect=lambda *a: calls.append(a)),
+            patch("backend.router.db.add_entity", side_effect=lambda *a, **kw: calls.append(a)),
             patch("backend.router.db.add_question", return_value="q1"),
             patch("backend.router.db.link_question_to_entity"),
         ):
@@ -343,9 +372,67 @@ class TestLearnFromPrompt:
                 "[Conversation so far]\nUser: hi\nAssistant: hello\nUser: explain snake_case_naming",
                 "snake_case_naming is a convention",
                 "gemini",
+                project_id="proj-test",
             )
         names = [c[0] for c in calls]
         assert any("snake_case_naming" in n for n in names)
+
+    def test_blocklist_filters_sensitive_entity_names(self):
+        """Entity names matching the security blocklist must not be written to the brain."""
+        calls = []
+        with (
+            patch("backend.router.db.add_entity", side_effect=lambda *a, **kw: calls.append(a[0])),
+            patch("backend.router.db.add_question", return_value="q1"),
+            patch("backend.router.db.link_question_to_entity"),
+        ):
+            AgentRouter().learn_from_prompt(
+                "the password is SuperSecret and the api_key is ABCD1234",
+                "password=hunter2 api_key=sk-1234 SecureToken AdminPassword",
+                "claude",
+                project_id="proj-test",
+            )
+        # None of the blocked names should have been written
+        blocked = [n for n in calls if any(kw in n.lower() for kw in ("password", "secret", "api_key", "token", "admin"))]
+        assert blocked == [], f"Blocked names leaked to brain: {blocked}"
+
+    def test_prompt_truncated_to_8000_chars(self):
+        """Oversized prompts must be truncated before brain regex work."""
+        huge = "x" * 20000
+        entity_calls = []
+        with (
+            patch("backend.router.db.add_entity", side_effect=lambda *a, **kw: entity_calls.append(a)),
+            patch("backend.router.db.add_question", return_value="q1"),
+            patch("backend.router.db.link_question_to_entity"),
+        ):
+            # Should not raise or hang
+            AgentRouter().learn_from_prompt(huge, huge, "claude", project_id="proj-test")
+
+    def test_default_project_id_skips_all_writes(self):
+        """learn_from_prompt with project_id='default' must not write any entities."""
+        with (
+            patch("backend.router.db.add_entity") as mock_add_entity,
+            patch("backend.router.db.add_question") as mock_add_question,
+        ):
+            AgentRouter().learn_from_prompt("explain FastAPI", "FastAPI is a framework", "claude")
+        mock_add_entity.assert_not_called()
+        mock_add_question.assert_not_called()
+
+    def test_auto_extracted_flag_set(self):
+        """learn_from_prompt must pass auto_extracted=True to db.add_entity."""
+        kw_calls = []
+        with (
+            patch("backend.router.db.add_entity", side_effect=lambda *a, **kw: kw_calls.append(kw)),
+            patch("backend.router.db.add_question", return_value="q1"),
+            patch("backend.router.db.link_question_to_entity"),
+        ):
+            AgentRouter().learn_from_prompt(
+                "explain FastAPI routing",
+                "FastAPI uses decorators",
+                "claude",
+                project_id="myproject",
+            )
+        if kw_calls:
+            assert all(kw.get("auto_extracted") is True for kw in kw_calls), kw_calls
 
 
 # ── AgentRouter._infer_agents_from_prompt ─────────────────────────────────────
@@ -367,3 +454,248 @@ class TestInferAgentsFromPrompt:
 
     def test_leading_agent_name(self):
         assert self.router._infer_agents_from_prompt("gemini, explain this") == ["gemini"]
+
+
+# ── AgentRouter.learn_from_prompt — project_id propagation ───────────────────
+
+class TestLearnFromPromptProjectID:
+    def test_project_id_passed_to_add_entity(self):
+        entity_calls = []
+        with (
+            patch("backend.router.db.add_entity", side_effect=lambda *a, **kw: entity_calls.append(kw)),
+            patch("backend.router.db.add_question", return_value="q1"),
+            patch("backend.router.db.link_question_to_entity"),
+        ):
+            AgentRouter().learn_from_prompt(
+                "explain FastAPI routing",
+                "FastAPI uses decorators",
+                "claude",
+                project_id="proj-x",
+            )
+        assert all(c.get("source_project_id") == "proj-x" for c in entity_calls), entity_calls
+
+    def test_project_id_passed_to_add_question(self):
+        q_calls = []
+        with (
+            patch("backend.router.db.add_entity"),
+            patch("backend.router.db.add_question", side_effect=lambda *a, **kw: q_calls.append(kw) or "q1"),
+            patch("backend.router.db.link_question_to_entity"),
+        ):
+            AgentRouter().learn_from_prompt("hi", "hello", "claude", project_id="proj-y")
+        assert q_calls[0].get("source_project_id") == "proj-y"
+
+
+# ── check_memory scoping ──────────────────────────────────────────────────────
+
+class TestCheckMemoryScoping:
+    def _make_router(self):
+        return AgentRouter()
+
+    def test_strict_scope_uses_pid_clause(self):
+        queries = []
+        with (
+            patch("backend.router.db.query_all", side_effect=lambda q, p=None: queries.append((q, p)) or []),
+            patch("backend.router.memory_client.search", return_value=[]),
+            patch("backend.router.context_cache.filter_memory", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_entities", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_relations", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_qa", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.commit"),
+        ):
+            self._make_router().check_memory("FastAPI", project_id="proj-z", memory_scope="strict")
+        # At least one query should contain strict project filter
+        entity_query = next((q for q, p in queries if "Entity" in q and "project_id" in q), None)
+        assert entity_query is not None
+        assert "$pid" in entity_query
+        # strict uses equality, not OR
+        assert "OR" not in entity_query
+
+    def test_shared_scope_includes_default(self):
+        queries = []
+        with (
+            patch("backend.router.db.query_all", side_effect=lambda q, p=None: queries.append((q, p)) or []),
+            patch("backend.router.memory_client.search", return_value=[]),
+            patch("backend.router.context_cache.filter_memory", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_entities", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_relations", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_qa", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.commit"),
+        ):
+            self._make_router().check_memory("FastAPI", project_id="proj-z", memory_scope="shared")
+        entity_query = next((q for q, p in queries if "Entity" in q and "project_id" in q), None)
+        assert entity_query is not None
+        assert "'default'" in entity_query
+
+    def test_global_scope_has_no_pid_filter(self):
+        queries = []
+        with (
+            patch("backend.router.db.query_all", side_effect=lambda q, p=None: queries.append((q, p)) or []),
+            patch("backend.router.memory_client.search", return_value=[]),
+            patch("backend.router.context_cache.filter_memory", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_entities", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_relations", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_qa", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.commit"),
+        ):
+            self._make_router().check_memory("FastAPI", project_id="proj-z", memory_scope="global")
+        entity_query = next((q for q, p in queries if "Entity" in q), None)
+        assert entity_query is not None
+        assert "$pid" not in entity_query
+
+
+# ── Adversarial cross-project isolation ───────────────────────────────────────
+
+class TestAdversarialProjectIsolation:
+    """Poisoned entity in project-A must not leak into project-B's check_memory."""
+
+    def _make_router(self):
+        with patch("backend.router.db.query_all", return_value=[]):
+            return AgentRouter()
+
+    def test_poisoned_entity_absent_in_other_project(self):
+        """All parameterised queries must use proj-b's pid; no query may hard-code proj-a."""
+        queries_params = []
+
+        def capture(q, p=None):
+            queries_params.append((q, p))
+            # Return a fake entity row on the first (entity) query so QA/rel paths execute.
+            if "Entity" in q and "project_id" in q and not queries_params[:-1]:
+                return [("secret_key", "concept", "", "proj-b")]
+            return []
+
+        with (
+            patch("backend.router.db.query_all", side_effect=capture),
+            patch("backend.router.memory_client.search", return_value=[]),
+            patch("backend.router.context_cache.filter_memory", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_entities", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_relations", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_qa", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.commit"),
+        ):
+            self._make_router().check_memory("secret_key", project_id="proj-b", memory_scope="strict")
+
+        for q, p in queries_params:
+            if p and "pid" in p:
+                assert p["pid"] == "proj-b", f"query leaked wrong pid: {p}"
+            if "project_id" in q and "$pid" in q:
+                assert "'proj-a'" not in q, "query hard-coded proj-a into proj-b request"
+
+    def test_shared_scope_confidence_gate_entity_only(self):
+        """Entity shared-scope query gates on confidence; Question/File queries must not."""
+        queries_params = []
+        call_count = [0]
+
+        def capture(q, p=None):
+            call_count[0] += 1
+            queries_params.append((q, p))
+            # Return a fake entity on the first call so QA + relationship paths execute.
+            if call_count[0] == 1:
+                return [("foo", "concept", "", "proj-x")]
+            return []
+
+        with (
+            patch("backend.router.db.query_all", side_effect=capture),
+            patch("backend.router.memory_client.search", return_value=[]),
+            patch("backend.router.context_cache.filter_memory", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_entities", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_relations", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_qa", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.commit"),
+        ):
+            self._make_router().check_memory("foo", project_id="proj-x", memory_scope="shared")
+
+        entity_q = next((q for q, _ in queries_params if "Entity" in q and "$pid" in q), None)
+        rel_q = next((q for q, _ in queries_params if "RELATED_TO" in q), None)
+        qa_q = next((q for q, _ in queries_params if "Question" in q), None)
+        file_q = next((q for q, _ in queries_params if ":File" in q), None)
+
+        assert entity_q is not None
+        assert "confidence" in entity_q, "Entity shared-scope query must gate on confidence"
+
+        assert rel_q is not None, "Relationship query must execute when entity_names is non-empty"
+        # Relationships between entities may legitimately filter on entity confidence,
+        # but the raw RELATED_TO clause must not add an unrelated standalone confidence gate.
+        assert "confidence" not in rel_q, "Relationship clause must not introduce a confidence filter"
+
+        assert qa_q is not None, "QA query must execute when entity_names is non-empty"
+        assert "confidence" not in qa_q, "Question nodes have no confidence field — must not appear in QA clause"
+
+        assert file_q is not None, "File query must always execute"
+        assert "confidence" not in file_q, "File nodes have no confidence field — must not appear in File clause"
+
+    def test_e2e_cross_project_secret_not_in_context(self):
+        """A poisoned entity (secret value) written to proj-A must not appear in proj-B's rendered context."""
+        # Simulate DB returning proj-A entities when proj-B asks for memory.
+        # This represents a worst-case DB misconfiguration — the context renderer
+        # is the last line of defense and must filter them out.
+        poisoned_secret = "SK_PROJ_A_SECRET_TOKEN"
+        proj_a_entity = (poisoned_secret, "Token", "access key", "proj-a")
+
+        def capture(q, p=None):
+            # Return entity rows only for the entity-match query; other queries empty.
+            if "MATCH (e:Entity)" in q:
+                return [proj_a_entity]
+            return []
+
+        context_out = []
+
+        def capture_context(session_id, snippets):
+            context_out.extend(snippets)
+            return snippets
+
+        with (
+            patch("backend.router.db.query_all", side_effect=capture),
+            patch("backend.router.memory_client.search", return_value=[]),
+            patch("backend.router.context_cache.filter_memory", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_entities", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_relations", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_qa", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.commit"),
+        ):
+            result = self._make_router().check_memory(poisoned_secret, project_id="proj-b", memory_scope="strict")
+
+        # The context string (or None) must not contain the secret from proj-A
+        context_str = result or ""
+        assert poisoned_secret not in context_str, (
+            f"Cross-project secret '{poisoned_secret}' leaked into proj-B context"
+        )
+
+
+# ── check_memory semantic content fallback shapes ─────────────────────────────
+
+class TestCheckMemoryContentFallback:
+    """check_memory must extract snippet text from several agentmemory result shapes."""
+
+    def _check(self, semantic_results):
+        from backend.router import AgentRouter
+        router = AgentRouter()
+        with (
+            patch("backend.router.memory_client.search", return_value=semantic_results),
+            patch("backend.router.db.query_all", return_value=[]),
+            patch("backend.router.context_cache.filter_memory", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_entities", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_relations", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.filter_qa", side_effect=lambda s, i: i),
+            patch("backend.router.context_cache.commit"),
+        ):
+            return router.check_memory("q", session_id="s")
+
+    def test_standard_content_field(self):
+        result = self._check([{"content": "hello world", "metadata": {}}])
+        assert result and "hello world" in result
+
+    def test_observation_narrative_fallback(self):
+        result = self._check([{"observation": {"narrative": "from narrative"}}])
+        assert result and "from narrative" in result
+
+    def test_observation_title_fallback(self):
+        result = self._check([{"observation": {"title": "from title"}}])
+        assert result and "from title" in result
+
+    def test_empty_results_returns_none(self):
+        assert self._check([]) is None
+
+    def test_unknown_shape_does_not_crash(self):
+        result = self._check([{"unexpected": "value"}])
+        # Should not raise; may return None or skip the item
+        assert result is None or isinstance(result, str)

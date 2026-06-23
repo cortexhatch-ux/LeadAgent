@@ -2,6 +2,7 @@
 
 import threading
 import time
+import os
 
 import pytest
 
@@ -156,6 +157,47 @@ class TestAllowCache:
     def test_remember_allow_directly(self, broker):
         broker.remember_allow("s1", "claude", "Bash", {"command": "ls"})
         assert broker.is_allowed("s1", "claude", "Bash", {"command": "ls"})
+
+
+# ── session-wide allow ────────────────────────────────────────────────────────
+
+class TestBroadSessionAllow:
+    def test_allow_session_applies_to_different_fingerprints(self, broker):
+        # 1. Ask for 'sed', allow for session
+        pr = broker.create("s1", "claude", "Bash", {"command": "sed ..."})
+        broker.decide(pr.id, "allow", "session")
+        broker.wait(pr.id, timeout=1.0)
+
+        # 2. Check 'ls' — should be allowed now!
+        assert broker.is_allowed("s1", "claude", "Bash", {"command": "ls -la"})
+
+    def test_allow_session_applies_to_different_agents(self, broker):
+        # 1. Claude asks for 'sed', allow for session
+        pr = broker.create("s1", "claude", "Bash", {"command": "sed ..."})
+        broker.decide(pr.id, "allow", "session")
+        broker.wait(pr.id, timeout=1.0)
+
+        # 2. Grok asks for 'sed' (or anything) — should be allowed now!
+        assert broker.is_allowed("s1", "grok", "Bash", {"command": "sed ..."})
+        assert broker.is_allowed("s1", "grok", "Bash", {"command": "ls"})
+
+    def test_high_risk_commands_always_prompt(self, broker):
+        # 1. Allow Bash for the session
+        broker.remember_allow("s1", "claude", "Bash", {"command": "ls"}, scope="session")
+        assert broker.is_allowed("s1", "claude", "Bash", {"command": "ls"})
+
+        # 2. But 'sudo' and 'rm' should STILL return False (prompt required)
+        assert not broker.is_allowed("s1", "claude", "Bash", {"command": "sudo apt update"})
+        assert not broker.is_allowed("s1", "claude", "Bash", {"command": "rm -rf /"})
+        assert not broker.is_allowed("s1", "claude", "Bash", {"command": "chmod +x script.sh"})
+        
+        # 3. Bare pip install should also return False
+        assert not broker.is_allowed("s1", "claude", "Bash", {"command": "pip3 install requests"})
+        
+        # 4. Pip install WITH venv path should return True
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        venv_pip = os.path.join(project_root, "leadagent", "bin", "pip3")
+        assert broker.is_allowed("s1", "claude", "Bash", {"command": f"{venv_pip} install requests"})
 
 
 # ── fingerprint ───────────────────────────────────────────────────────────────

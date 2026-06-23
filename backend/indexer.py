@@ -41,7 +41,7 @@ Content Snippet:
 """
     try:
         response = requests.post(url, json={
-            "model": "llama3",
+            "model": os.environ.get("LEADAGENT_OLLAMA_MODEL", "llama3.2:3b"),
             "prompt": prompt,
             "stream": False,
             "format": "json"
@@ -68,17 +68,24 @@ def process_file(file_path: str, project_id: str = "default"):
         data = extract_entities_via_ollama(file_path, content)
         
         # 3. Insert into Graph
+        from backend.security import scrub_secrets, is_blocked_entity
         for e in data.get("entities", []):
+            name = e["name"]
+            if is_blocked_entity(name):
+                continue
+            description = scrub_secrets(e.get("description", ""))
             db.add_entity(
-                e["name"],
+                name,
                 e["type"],
-                e.get("description", ""),
-                project_id=project_id,
+                description,
+                source_project_id=project_id,
+                auto_extracted=True,
+                source_agent="indexer",
             )
-            db.link_entity_to_file(e["name"], file_path)
+            db.link_entity_to_file(e["name"], file_path, project_id=project_id)
         
         for r in data.get("relationships", []):
-            db.add_relationship(r["source"], r["target"], r["type"])
+            db.add_relationship(r["source"], r["target"], r["type"], project_id=project_id)
             
         print(f"✅ Proactively indexed {file_path} ({len(data.get('entities', []))} entities)")
         return True

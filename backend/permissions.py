@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 import uuid
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
@@ -73,19 +74,59 @@ class PermissionBroker:
                 return fp.rsplit("/", 1)[0] or fp
         return ""
 
+    def _is_high_risk(self, tool_name: str, input_: Dict[str, Any]) -> bool:
+        """Identify commands that should NEVER be auto-approved via 'allow session'."""
+        if tool_name.lower() == "bash":
+            cmd = str(input_.get("command", "")).lower().strip()
+            # sudo/root operations
+            if "sudo " in cmd or cmd.startswith("sudo"):
+                return True
+            # Deletions
+            if "rm " in cmd or cmd.startswith("rm"):
+                return True
+            # System modification risks (crontab, chmod, etc.)
+            risky_bins = ("chmod", "chown", "crontab", "reboot", "shutdown")
+            if any(cmd.startswith(bin) or f" {bin} " in cmd for bin in risky_bins):
+                return True
+
+            # Pip installs MUST use the LeadAgent venv
+            if ("pip " in cmd or "pip3 " in cmd) and "install " in cmd:
+                # If it's a bare 'pip install' or 'pip3 install' without the venv path, it's high risk
+                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                venv_path = os.path.join(project_root, "leadagent")
+                if venv_path.lower() not in cmd:
+                    return True
+        return False
+
     def is_allowed(
         self, session_id: str, agent: str, tool_name: str, input_: Dict[str, Any]
     ) -> bool:
-        key = (session_id, agent, tool_name, self._fingerprint(tool_name, input_))
+        # High-risk commands ALWAYS require a manual 'once' approval
+        if self._is_high_risk(tool_name, input_):
+            return False
+
         with self._lock:
+            # 1. Check for a session-wide tool allow (highest precedence, agent-agnostic)
+            if self._allow_cache.get((session_id, "*", tool_name, "*"), False):
+                return True
+            # 2. Check for an agent-specific tool allow
+            if self._allow_cache.get((session_id, agent, tool_name, "*"), False):
+                return True
+            # 3. Check for the specific fingerprint (legacy/conservative)
+            key = (session_id, agent, tool_name, self._fingerprint(tool_name, input_))
             return self._allow_cache.get(key, False)
 
     def remember_allow(
-        self, session_id: str, agent: str, tool_name: str, input_: Dict[str, Any]
+        self, session_id: str, agent: str, tool_name: str, input_: Dict[str, Any], scope: str = "session"
     ) -> None:
-        key = (session_id, agent, tool_name, self._fingerprint(tool_name, input_))
         with self._lock:
-            self._allow_cache[key] = True
+            if scope == "session":
+                # Broad allow: this tool is trusted for ALL agents in this session
+                self._allow_cache[(session_id, "*", tool_name, "*")] = True
+            else:
+                # Targeted allow: this specific command fingerprint for this agent
+                key = (session_id, agent, tool_name, self._fingerprint(tool_name, input_))
+                self._allow_cache[key] = True
 
     # ── request lifecycle ──────────────────────────────────────────────────
     def create(
@@ -133,7 +174,7 @@ class PermissionBroker:
                 else pr.input,
             }
         if behavior == "allow" and scope == "session":
-            self.remember_allow(pr.session_id, pr.agent, pr.tool_name, pr.input)
+            self.remember_allow(pr.session_id, pr.agent, pr.tool_name, pr.input, scope="session")
         pr.event.set()
         return True
 
